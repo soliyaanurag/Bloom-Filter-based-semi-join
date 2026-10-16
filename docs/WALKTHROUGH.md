@@ -1535,3 +1535,27 @@ cp results/final/*.png results/final/*.md results/final/*.csv docs/final/
 ```
 
 To follow a run: `tail -f results/final/run_*.log` (if you redirect the output there, as we did). Each line shows one strategy: median time, measured bytes, rows sent by B, join type, path/mode and `correct=`.
+
+## Batch 8b: does the adaptive choice beat a simple rule?
+
+No new measurements. `bench/final_report.py` now also compares four **policies**: original, always-index, always-filter and auto. It uses only the **forced-path** times, so the noise between an auto session and the forced session of the same plan does not count. Auto's time is the forced time of the path it chose. Each policy's regret is its time / the fastest of original, index and filter.
+
+- `policy_regrets()` and `summarize_policies()` compute the regret per configuration, then the mean, median, worst (with its configuration) and the number of configurations within 5% of the best.
+- They write `results/final/policy_comparison.csv` (one row per configuration) and `policy_comparison.md` (the summary table), and draw `policy_regret.png` (mean and worst regret per policy, log scale).
+- `regret.png` now shows `path_regret`, the forced time of the chosen path. So no bar falls below 1.0 because of session noise.
+
+| policy | mean regret | median | worst | within 5% of the best |
+|---|---:|---:|---|---:|
+| original | 231.20 | 24.81 | 2,609.97 (E5 n=100 10Mbit) | 0 of 38 |
+| always index | 1.03 | 1.00 | 1.22 (E1 n=150000 narrow) | 32 of 38 |
+| always filter | 8.08 | 2.49 | 50.16 (E2 n=1000 s=3M) | 11 of 38 |
+| auto | 1.08 | 1.00 | 2.51 (E3 n=50000 match=0.1) | 34 of 38 |
+
+In plain words:
+- The semijoin is the big win over plain postgres_fdw.
+- With compact int4 keys, "always index" is a strong simple rule, slightly better than auto on average. The filter path wins only by 2–22% (large n), and on localhost that win comes from site B's work (one scan instead of many lookups), not from the bytes.
+- Auto's E3/E4 mistakes (regret 2.09, 2.51, 1.34) cost more than its wins. Without E3/E4, auto beats always-index: mean 1.004 vs 1.037.
+
+`docs/final/summary.md`, section "Does the adaptive choice beat a simple rule?", gives the numbers behind each statement. It also has the calculation, not a measurement, of why wide keys such as UUIDs would make the Bloom filter matter much more.
+
+Rerun: `.venv/bin/python bench/final_report.py`, then copy `results/final/` to `docs/final/` as in Batch 8.

@@ -327,6 +327,112 @@ def write_headline(numbers):
 
 
 # ---------------------------------------------------------------------------
+# Batch 8b: policy comparison (no new measurements)
+# ---------------------------------------------------------------------------
+
+# A policy is a rule that picks a strategy for every query. We compare our
+# cost model with three simple rules, using only the FORCED-path times, so
+# the session noise between the auto run and the forced run of the same
+# plan does not count.
+POLICIES = ["original", "always_index", "always_filter", "auto"]
+POLICY_LABELS = {
+    "original": "original\n(plain postgres_fdw)",
+    "always_index": "always index",
+    "always_filter": "always filter",
+    "auto": "auto\n(our cost model)",
+}
+WITHIN_BEST = 1.05      # "within 5% of the best"
+
+
+def policy_time(entry, policy):
+    """
+    The time a policy gets in one configuration (forced-path times).
+
+    Input:  entry, a row of the decision-quality table; policy.
+    Output: the time in ms.
+    """
+    if policy == "original":
+        return entry["original_ms"]
+    if policy == "always_index":
+        return entry["index_ms"]
+    if policy == "always_filter":
+        return entry["filter_ms"]
+    # auto: the forced run of the path the cost model chose
+    if entry["auto_choice"].startswith("filter"):
+        return entry["filter_ms"]
+    return entry["index_ms"]
+
+
+def policy_regrets(table):
+    """
+    The regret of every policy in every configuration, relative to the
+    fastest of original, index and filter.
+
+    Input:  table, from decision_quality.
+    Output: a list of dicts: config, then one regret column per policy.
+    """
+    result = []
+    for entry in table:
+        best_time = min(entry["original_ms"], entry["index_ms"], entry["filter_ms"])
+        row = {"config": entry["config"]}
+        for policy in POLICIES:
+            row[policy] = policy_time(entry, policy) / best_time
+        result.append(row)
+    return result
+
+
+def summarize_policies(regret_rows):
+    """
+    Mean, median and worst regret of each policy, which configuration was
+    the worst, and in how many configurations the policy was within 5% of
+    the best.
+
+    Input:  regret_rows, from policy_regrets.
+    Output: a list of dicts, one per policy.
+    """
+    summary = []
+    for policy in POLICIES:
+        values = [row[policy] for row in regret_rows]
+        worst_row = max(regret_rows, key=lambda row: row[policy])
+        summary.append({
+            "policy": policy,
+            "mean": statistics.mean(values),
+            "median": statistics.median(values),
+            "worst": worst_row[policy],
+            "worst_config": worst_row["config"],
+            "within_5_percent": sum(1 for value in values if value <= WITHIN_BEST),
+            "configurations": len(values),
+        })
+    return summary
+
+
+def write_policy_comparison(regret_rows, summary):
+    """
+    Write policy_comparison.csv (one row per configuration) and
+    policy_comparison.md (the summary table).
+
+    Input:  regret_rows; summary.
+    Output: nothing.
+    """
+    with open(os.path.join(RESULTS_DIR, "policy_comparison.csv"), "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["config"] + POLICIES)
+        writer.writeheader()
+        for row in regret_rows:
+            writer.writerow(row)
+
+    lines = ["| policy | mean regret | median regret | worst regret (configuration) "
+             "| within 5% of the best |",
+             "|---|---:|---:|---|---:|"]
+    for entry in summary:
+        name = POLICY_LABELS[entry["policy"]].replace("\n", " ")
+        lines.append(f"| {name} | {entry['mean']:,.2f} | {entry['median']:,.2f} "
+                     f"| {entry['worst']:,.2f} ({entry['worst_config']}) "
+                     f"| {entry['within_5_percent']} of {entry['configurations']} |")
+    with open(os.path.join(RESULTS_DIR, "policy_comparison.md"), "w") as md_file:
+        md_file.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Charts
 # ---------------------------------------------------------------------------
 
@@ -441,6 +547,39 @@ def chart_bars(table, value_column, ylabel, title, file_name, log_scale=False, r
     axes.legend(handles=[Patch(color=STYLE["auto"]["color"], label="auto chose the fastest path"),
                          Patch(color="#6250d6", label="auto chose a slower path")], fontsize=8)
     save(figure, file_name)
+
+
+def chart_policies(summary):
+    """
+    Batch 8b: mean and worst regret of each policy, side by side (log
+    scale, because "original" is hundreds of times slower), with a line at
+    1.0 (= always as fast as the best strategy).
+
+    Input:  summary, from summarize_policies.
+    Output: nothing.
+    """
+    figure, axes = plt.subplots(figsize=(8, 5))
+    positions = list(range(len(summary)))
+    bar_width = 0.38
+    axes.bar([p - bar_width / 2 for p in positions], [entry["mean"] for entry in summary],
+             width=bar_width * 0.92, color="#2a78d6", label="mean regret")
+    axes.bar([p + bar_width / 2 for p in positions], [entry["worst"] for entry in summary],
+             width=bar_width * 0.92, color="#eb6834", label="worst regret")
+    # print the values on the bars, so the small differences are readable
+    for position, entry in zip(positions, summary):
+        axes.text(position - bar_width / 2, entry["mean"] * 1.08, f"{entry['mean']:.2f}",
+                  ha="center", fontsize=8, color="#0b0b0b")
+        axes.text(position + bar_width / 2, entry["worst"] * 1.08, f"{entry['worst']:.2f}",
+                  ha="center", fontsize=8, color="#0b0b0b")
+    axes.axhline(1.0, color="#52514e", linewidth=1.2, linestyle="--")
+    axes.set_yscale("log")
+    axes.set_xticks(positions)
+    axes.set_xticklabels([POLICY_LABELS[entry["policy"]] for entry in summary], fontsize=9)
+    style_axes(axes, f"Regret of four policies over {summary[0]['configurations']} configurations\n"
+                     "(forced-path times; 1.00 = always as fast as the best strategy)",
+               "", "regret = policy time / fastest time (log scale)")
+    axes.legend(fontsize=8)
+    save(figure, "policy_regret.png")
 
 
 def chart_predicted_vs_measured(rows):
@@ -654,14 +793,26 @@ def main():
     with open(os.path.join(RESULTS_DIR, "headline.md")) as md_file:
         print(md_file.read())
 
+    # Batch 8b: four policies, forced-path times only
+    regret_rows = policy_regrets(table)
+    policy_summary = summarize_policies(regret_rows)
+    write_policy_comparison(regret_rows, policy_summary)
+    print("Policy comparison (regret vs the fastest of original/index/filter, forced-path times):")
+    with open(os.path.join(RESULTS_DIR, "policy_comparison.md")) as md_file:
+        print(md_file.read())
+
     print("Charts:")
     chart_e1(rows, "time_ms", "end-to-end time (ms, log scale)", "time_vs_n",
              "E1: query time vs n")
     chart_e1(rows, "measured_bytes", "measured bytes on lo (log scale)", "bytes_vs_n",
              "E1: real network bytes vs n")
-    chart_bars(table, "regret", "regret = auto time / fastest time",
-               "Regret per configuration (1.00 = auto was as fast as the best strategy)",
+    # Batch 8b: the forced run of the path auto chose (path_regret), so no
+    # bar falls below 1.0 because of session noise
+    chart_bars(table, "path_regret", "regret = time of the chosen path / fastest time",
+               "Regret per configuration: forced-path time of the path auto chose\n"
+               "(1.00 = auto chose the fastest strategy)",
                "regret.png", reference=1.0)
+    chart_policies(policy_summary)
     chart_bars(table, "speedup", "speedup = original time / auto time (log scale)",
                "Speedup of auto over plain postgres_fdw, per configuration",
                "speedup.png", log_scale=True, reference=1.0)

@@ -89,6 +89,59 @@ Two more cases are worth knowing:
 - **The filter path at small n.** At n = 100 the filter path is about 50× slower than the index path (100 ms vs 2 ms), because B checks all 1,000,000 rows. The model never chose it there.
 - **Measurement noise.** E3 with n = 10,000 and 50% of the keys at B shows regret 1.32, although auto chose the right path. Auto and index ran the identical plan; the difference is session-to-session noise.
 
+## Does the adaptive choice beat a simple rule?
+
+A **policy** is a rule that picks a strategy for every query. We compare our cost model with three simple rules. All four use only the forced-path times, so session noise between auto and its forced twin does not count. Regret is measured against the fastest of original, index and filter, over all 38 configurations. No new measurements: this uses the decision-quality data above (`policy_comparison.csv`, `policy_regret.png`).
+
+| policy | mean regret | median regret | worst regret (configuration) | within 5% of the best |
+|---|---:|---:|---|---:|
+| original (plain postgres_fdw) | 231.20 | 24.81 | 2,609.97 (E5 n=100 10Mbit) | 0 of 38 |
+| always index | **1.03** | 1.00 | **1.22** (E1 n=150000 narrow) | 32 of 38 |
+| always filter | 8.08 | 2.49 | 50.16 (E2 n=1000 s=3M) | 11 of 38 |
+| auto (our cost model) | 1.08 | 1.00 | 2.51 (E3 n=50000 match=0.1) | **34 of 38** |
+
+**The big win is the semijoin itself, not the choice between its two paths.**
+- Plain postgres_fdw is 25× slower than the best strategy in the median configuration, and never within 5% of it.
+- Its smallest regret is 1.32 (E2 n=50000, 100,000 customers), so sending B the keys was faster in every one of the 38 configurations.
+
+**On this workload, "always index" is a strong simple rule. It is slightly better than our cost model on average (1.03 vs 1.08) and in the worst case (1.22 vs 2.51).**
+- An int4 key list is compact. As text it costs 6.9 bytes per key: 959,553 bytes for 139,294 keys at n = 150,000. The Bloom filter sent instead is 432,792 bytes (hex), only 2.2× smaller.
+- Next to the 5.2 MB of rows that both paths bring back, that difference is small.
+- "Always filter" is a poor rule. At small n, site B still scans every row: 359 ms instead of 7 ms with 3,000,000 customers.
+
+**The filter path (usually Bloom) wins only by 2–22%.** It was faster than the index path in 11 of 38 configurations, all with n ≥ 50,000. Always-index's regret there is 1.019–1.224:
+
+| where the filter path won | always-index regret | saved by the filter path |
+|---|---:|---:|
+| localhost, n = 50,000 (narrow / wide / binary) | 1.04 / 1.12 / 1.11 | 13 / 38 / 33 ms |
+| localhost, n = 150,000 (narrow / wide / binary) | 1.22 / 1.16 / 1.21 | 116 / 93 / 111 ms |
+| 100,000 customers, n = 50,000 | 1.05 | 6 ms |
+| 100 Mbit, n = 50,000 / 150,000 (EXACT mode, not Bloom) | 1.02 / 1.04 | 30 / 161 ms |
+| 10 Mbit, n = 50,000 / 150,000 (Bloom) | 1.04 / 1.06 | 105 / 439 ms |
+
+Two honest corrections to the usual "Bloom wins on slow networks" story:
+
+- **On localhost the filter path wins because of site B's work, not because of the bytes.** At n = 150,000 the two paths differ by only 0.45 MB (5.68 vs 5.23 MB), which is 4 ms at 1000 Mbit/s. The 116 ms come from B scanning 1,000,000 rows once instead of making 139,294 index lookups.
+- **On the slow network the absolute saving grows, but the percentage does not.**
+  - At 10 Mbit, n = 150,000, Bloom saves 439 ms. That matches the 527 KB smaller filter: 959,553 − 432,792 bytes = 0.42 s at 10 Mbit.
+  - That is still only 6% of the 7.9 s total, because the 5.2 MB of rows coming back are the same on both paths and dominate the time.
+  - At 100 Mbit the cost model even preferred an EXACT key list, because each Bloom false positive is an extra row that costs FETCH round trips.
+
+**Auto's mistakes cost more than its wins.** Where auto correctly picked the filter path, it saved 2–22% over always-index (the regrets in the table above). Its four wrong choices cost more:
+
+| auto's wrong choice | auto regret (forced path) | why |
+|---|---:|---|
+| E3, n = 50,000, 10% of keys at B | 2.51 | the model assumes every key exists at B; missing keys are cheap to look up |
+| E3, n = 50,000, 50% of keys at B | 2.09 | same reason |
+| E4, n = 50,000, skewed keys | 1.34 | clustered keys make index lookups cache-friendly (not modelled) |
+| E2, n = 10,000, 100,000 customers | 1.12 | a near tie |
+
+Without E3 and E4 (two factors the model does not know about), auto beats always-index: over the remaining 29 configurations, mean regret 1.004 vs 1.037 and worst 1.12 vs 1.22. So the model is good when its assumptions hold. Its weakness is the assumptions, not the arithmetic.
+
+**Where Bloom should matter more (a calculation, not a measurement):**
+- **Wide keys.** Version 1 supports only int4 keys. A key list of UUIDs as text would cost about 37 bytes per key instead of 6.9. That is about 5.15 MB instead of 0.96 MB for the same 139,294 keys, while the Bloom filter stays 433 KB, because its size depends on the number of keys, not their width. At 10 Mbit the extra 4.2 MB would add about 3.4 s to the index path: about 11.7 s against the filter path's 7.9 s, a 32% win instead of the measured 6%. For text keys or UUIDs the filter's compactness would decide the choice; for int4 it barely matters.
+- **Slower networks.** Here this holds only together with wide keys or a filter that removes many more rows. As long as both paths return the same rows, a slower network makes both slower about equally.
+
 ## Known limitations
 
 - **Version 1 scope:** only INNER JOIN, one equality join condition, int4 keys. Set operations (such as EXCEPT ALL) and queries planned in parallel mode are not rewritten.
@@ -117,9 +170,10 @@ Our byte estimates were within ±6% of the measured bytes for every transfer abo
 |---|---|
 | `time_vs_n_narrow.png`, `time_vs_n_wide.png` | E1: end-to-end time vs n, per strategy |
 | `bytes_vs_n_narrow.png`, `bytes_vs_n_wide.png` | E1: real bytes on the network vs n |
-| `regret.png` | regret per configuration (purple = a wrong choice), line at 1.0 |
+| `regret.png` | regret per configuration, using the forced-path time of the path auto chose (purple = a wrong choice), line at 1.0 |
+| `policy_regret.png` | mean and worst regret of the four policies: original, always index, always filter, auto |
 | `speedup.png` | speedup of auto over plain postgres_fdw, per configuration |
 | `predicted_vs_measured.png` | the model's predicted time vs the measured time, with y = x; red = model not told about the network |
 | `e2_s_rows.png` … `e6_binary_filter.png` | one chart per experiment |
 
-The full decision-quality table (one row per configuration) is in `decision_quality.md` and `decision_quality.csv`.
+The full decision-quality table (one row per configuration) is in `decision_quality.md` and `decision_quality.csv`; the policy regrets per configuration are in `policy_comparison.csv`.
