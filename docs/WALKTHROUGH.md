@@ -550,4 +550,4 @@ bench/run_all.sh
 
 This needs the server running (`pg_ctl status`), both sites set up (`setup/setup_all.sh`), and the `.venv` from above. It takes about 5 minutes. It runs `run_experiments.py` (appends to `results/results.csv`), `b_sweep.py` (rewrites `results/b_sweep.csv`) and `plot.py` (rewrites the PNGs and `results/fp_rate.csv`). To start results.csv fresh, delete it first. The scripts can also be run one at a time, e.g. `.venv/bin/python bench/plot.py`.
 
-`results/` is in `.gitignore`, so the CSVs and charts are not committed; every teammate regenerates them on their own machine.
+`results/` is in `.gitignore`, so each run writes there without touching git. A frozen copy of the mid-sem CSVs and charts is committed in `docs/midsem/`.

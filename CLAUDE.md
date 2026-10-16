@@ -47,10 +47,13 @@ A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chose
 - If a check fails, do not hack around it. Show me the output and explain what you think is wrong.
 
 ## Current status and lessons learned
-- Batches 0, 1, 2 and 3 are done and committed. Next is Batch 4.
+- Batches 0, 1, 2, 3 and 4 are done and committed. The mid-sem charts and CSVs are in docs/midsem/ (results/ stays in .gitignore). Next is a short false-positive investigation (branch fp-investigation), then Batch 5.
 - postgres_fdw was installed by the user from the source tree. Do not reinstall it, and never touch ~/postgres/postgresql.
 - `= ANY` with a sub-SELECT needs an `::int[]` cast: `= ANY ((SELECT array_agg(...) ...)::int[])`. Without it, PostgreSQL treats the subquery as a row set and fails with "operator does not exist: integer = integer[]".
 - In test queries, build filters in a `WITH ... AS MATERIALIZED` CTE so they are built once, not once per row.
 - setup/setup_all.sh drops both sites, then (since Batch 3) creates sjbloom in both and runs setup/enable_sjbloom.sql. The extension must be installed first (make -C sjbloom install).
 - Bloom false positives scale with the size of S, not R': at b=10 (fp ~0.8%) about 8,000 of the 999k non-matching customers pass. Use sjb_best_bits to pick b.
-- The planner underestimates foreign scan rows for `= ANY` (it guessed 10; the real number was 999) and picks a nested loop. Keep this in mind for timing measurements later.
+- The planner underestimates foreign scan rows for `= ANY` (it guesses 10; the real number was 999) and picks a Nested Loop with a Join Filter for exact_keys at small n. When comparing times, use the exact_keys runs with nestloop_off = True (SET enable_nestloop = off): 134 ms vs 7 ms at n=1000.
+- Python venv on this WSL: `python3 -m venv` fails (ensurepip missing, python3.12-venv not installed). Workaround without sudo: `python3 -m venv --without-pip .venv` then `pip --python .venv/bin/python install -r bench/requirements.txt`. Run all benchmarks with `bench/run_all.sh`.
+- Locally, Bloom is slower than exact_keys (about 150 ms minimum even for tiny n): site B must run sjb_contains on all 1,000,000 rows and cannot use its index, while `customer_id = ANY ($1)` can use the primary-key index at B. Bloom only wins on bytes, not on local time.
+- Our byte estimates ignore PostgreSQL protocol overhead: each returned row is a DataRow message of about 7 + 4*columns bytes plus the values (15 bytes for 2 columns, about as much as a narrow row itself). The cost model will need this added to row_width.
