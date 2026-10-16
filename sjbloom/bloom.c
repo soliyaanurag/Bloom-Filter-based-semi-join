@@ -71,6 +71,32 @@ compute_two_hashes(int32 key, uint64 seed, uint32 *h1, uint32 *h2)
 }
 
 /*
+ * step_to_next_position
+ *
+ * What it does: one step of enhanced double hashing. Moves the current
+ * position x forward by the step y, then makes the step i bigger:
+ *     x = (x + y) mod m
+ *     y = (y + i) mod m
+ * After the call, *x is position number i.
+ *
+ * Inputs:  x, y - pointers to the current position and step (both < m);
+ *                 both are updated
+ *          i    - the number of the position being computed (1 .. k-1)
+ *          m    - number of bits in the filter
+ * Output:  none (*x and *y are changed)
+ *
+ * Why it exists: compute_positions (used when adding a key) and
+ * sjb_bloom_test (used when testing a key) must produce exactly the same
+ * positions. Keeping the rule in one function guarantees that.
+ */
+static void
+step_to_next_position(uint64 *x, uint64 *y, int i, uint64 m)
+{
+	*x = (*x + *y) % m;
+	*y = (*y + (uint64) i) % m;
+}
+
+/*
  * compute_positions
  *
  * What it does: fills positions[0 .. k-1] with the k bit positions of a
@@ -106,8 +132,7 @@ compute_positions(uint32 h1, uint32 h2, int k, uint64 m, uint64 *positions)
 	positions[0] = x;
 	for (i = 1; i < k; i++)
 	{
-		x = (x + y) % m;
-		y = (y + (uint64) i) % m;
+		step_to_next_position(&x, &y, i, m);
 		positions[i] = x;
 	}
 }
@@ -189,24 +214,36 @@ sjb_bloom_add(uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
  * Output:  false if the key was certainly never added;
  *          true if the key was probably added (could be a false positive)
  *
- * Why it exists: called by sjb_contains for every row of S at site B.
- * It stops at the first 0 bit, because one 0 bit already proves the key
- * is not in the filter.
+ * Why it exists: called by sjb_contains for every row of S at site B,
+ * so it must be fast. It computes the positions ONE AT A TIME (the same
+ * positions as compute_positions, using the same step_to_next_position)
+ * and tests each bit at once. It stops at the first 0 bit, because one
+ * 0 bit already proves the key is not in the filter. In a well-sized
+ * filter about half the bits are 1, so most keys that are not in the
+ * filter are rejected after 1 or 2 positions instead of all k.
  */
 bool
 sjb_bloom_test(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
 {
 	uint32		h1;
 	uint32		h2;
-	uint64		positions[SJB_MAX_K];
+	uint64		x;
+	uint64		y;
 	int			i;
 
 	compute_two_hashes(key, seed, &h1, &h2);
-	compute_positions(h1, h2, k, m, positions);
 
-	for (i = 0; i < k; i++)
+	/* Position 0. */
+	x = (uint64) h1 % m;
+	y = (uint64) h2 % m;
+	if (!bit_is_set(bits, x))
+		return false;
+
+	/* Positions 1 .. k-1, each tested as soon as it is computed. */
+	for (i = 1; i < k; i++)
 	{
-		if (!bit_is_set(bits, positions[i]))
+		step_to_next_position(&x, &y, i, m);
+		if (!bit_is_set(bits, x))
 			return false;
 	}
 

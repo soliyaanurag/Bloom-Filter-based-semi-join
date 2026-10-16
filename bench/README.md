@@ -11,6 +11,7 @@
 | `b_sweep.py` | total bytes vs Bloom bits per key b, writes `results/b_sweep.csv` |
 | `plot.py` | draws the PNG charts in `results/` |
 | `run_all.sh` | runs the three scripts above in order |
+| `time_contains.py` | times site B's full scan with `sjb_contains` (median of 5), to compare two builds of the C code |
 | `capture_bytes.sh` | prints (does not run) tcpdump/capinfos commands for a packet-capture cross-check |
 
 Rerun everything: `source setup/env.example.sh && bench/run_all.sh`. See docs/WALKTHROUGH.md, Batch 4.
