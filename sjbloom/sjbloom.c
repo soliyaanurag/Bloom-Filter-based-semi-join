@@ -19,7 +19,8 @@
  *       Debugging: describe a filter in one line of text.
  *   sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
  *                     t_check_ns, t_lookup_us, per_message_ms,
- *                     per_row_us, t_build_us, fetch_size) RETURNS text
+ *                     per_row_us, t_build_us, fetch_size,
+ *                     max_filter_bytes) RETURNS text
  *       A readable report of the cost model's estimates.       (Batch 5)
  *   sjb_plan_choice(same arguments) RETURNS text
  *       'index' or 'filter': which path the cost model picks.  (Batch 5)
@@ -661,10 +662,10 @@ check_cost_inputs(const SjbCostInputs *inputs)
 /*
  * read_report_arguments
  *
- * What it does: reads the 11 arguments of sjb_choice_report and
+ * What it does: reads the 12 arguments of sjb_choice_report and
  * sjb_plan_choice (n, s_rows, rows_per_key, row_width, network_mbit,
  * t_check_ns, t_lookup_us, per_message_ms, per_row_us, t_build_us,
- * fetch_size) into an SjbCostInputs, uses the default max_filter_bytes,
+ * fetch_size, max_filter_bytes) into an SjbCostInputs, uses the default
  * wire_factor and key text length, and checks them.
  *
  * Inputs:  fcinfo - the function call info of the SQL function (it holds
@@ -689,7 +690,12 @@ read_report_arguments(FunctionCallInfo fcinfo, SjbCostInputs *inputs)
 	inputs->per_row_us = PG_GETARG_FLOAT8(8);
 	inputs->t_build_us = PG_GETARG_FLOAT8(9);
 	inputs->fetch_size = PG_GETARG_INT32(10);
-	inputs->max_filter_bytes = SJB_DEFAULT_MAX_FILTER_BYTES;
+
+	/*
+	 * Batch 6b: the same limit that sjb_build_auto gets, so that the plan
+	 * time decision and the run time filter agree (SQL default: 1 MB).
+	 */
+	inputs->max_filter_bytes = (double) PG_GETARG_INT64(11);
 	inputs->wire_factor = SJB_DEFAULT_WIRE_FACTOR;
 	inputs->key_text_len = SJB_DEFAULT_KEY_TEXT_LEN;
 
@@ -1063,7 +1069,8 @@ PG_FUNCTION_INFO_V1(sjb_choice_report);
 /*
  * sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
  *                   t_check_ns, t_lookup_us, per_message_ms, per_row_us,
- *                   t_build_us float8, fetch_size int4) RETURNS text
+ *                   t_build_us float8, fetch_size int4,
+ *                   max_filter_bytes int8) RETURNS text
  *
  * What it does: runs the cost model (sjb_estimate_all, the same code
  * sjb_build_auto uses) and returns a readable multi-line report: one line
@@ -1075,8 +1082,8 @@ PG_FUNCTION_INFO_V1(sjb_choice_report);
  * Inputs:  n            - number of distinct keys at site A
  *          s_rows .. t_check_ns - as for sjb_build_auto
  *          t_lookup_us  - time per key of the index path
- *          per_message_ms .. fetch_size - as for sjb_build_auto
- *          (max_filter_bytes = 1 MB and wire_factor = 2, the defaults)
+ *          per_message_ms .. fetch_size, max_filter_bytes - as for
+ *                         sjb_build_auto (wire_factor = 2, the default)
  * Output:  the report as text
  *
  * Why it exists: to explain and present the model's decisions, and for
@@ -1106,9 +1113,10 @@ sjb_choice_report(PG_FUNCTION_ARGS)
 					 inputs.row_width, inputs.network_mbit,
 					 inputs.t_check_ns, inputs.t_lookup_us);
 	appendStringInfo(&report,
-					 "        per_message_ms=%.4f per_row_us=%.4f t_build_us=%.4f fetch_size=%.0f\n",
+					 "        per_message_ms=%.4f per_row_us=%.4f t_build_us=%.4f fetch_size=%.0f max_filter_bytes=%.0f\n",
 					 inputs.per_message_ms, inputs.per_row_us,
-					 inputs.t_build_us, inputs.fetch_size);
+					 inputs.t_build_us, inputs.fetch_size,
+					 inputs.max_filter_bytes);
 	appendStringInfo(&report, "matching rows M = %.0f\n", choice.matching_rows);
 	appendStringInfo(&report, "%-7s %-6s %8s %12s %10s %12s %8s %11s %11s %9s %10s %10s %11s\n",
 					 "path", "mode", "bits/key", "bytes_A_to_B", "rows_back",
@@ -1146,8 +1154,7 @@ sjb_choice_report(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(sjb_plan_choice);
 
 /*
- * sjb_plan_choice(n, s_rows, rows_per_key, row_width, network_mbit,
- *                 t_check_ns, t_lookup_us float8) RETURNS text
+ * sjb_plan_choice(same 12 arguments as sjb_choice_report) RETURNS text
  *
  * What it does: returns 'index' if the index path is estimated to be
  * faster (or equal), otherwise 'filter'.
@@ -1155,7 +1162,7 @@ PG_FUNCTION_INFO_V1(sjb_plan_choice);
  * Inputs:  the same as sjb_choice_report
  * Output:  'index' or 'filter'
  *
- * Why it exists: Batch 6's planner hook will call this, so the decision
+ * Why it exists: Batch 6's planner hook calls this, so the decision
  * between the two paths lives in ONE place (sjb_estimate_all).
  */
 Datum

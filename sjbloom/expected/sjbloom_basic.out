@@ -217,7 +217,7 @@ SELECT sjb_choice_report(10000, 1e6, 1, 32, 1000, 150, 2, 0.06, 0.5, 0.25, 100) 
                                                                   report                                                                   
 -------------------------------------------------------------------------------------------------------------------------------------------
  inputs: n=10000 s_rows=1000000 rows_per_key=1 row_width=32.00 network_mbit=1000 t_check_ns=150.00 t_lookup_us=2.0000                     +
-         per_message_ms=0.0600 per_row_us=0.5000 t_build_us=0.2500 fetch_size=100                                                         +
+         per_message_ms=0.0600 per_row_us=0.5000 t_build_us=0.2500 fetch_size=100 max_filter_bytes=1048576                                +
  matching rows M = 10000                                                                                                                  +
  path    mode   bits/key bytes_A_to_B  rows_back bytes_B_to_A messages  network_ms messages_ms   rows_ms  work_A_ms  work_B_ms    total_ms+
  index   -             -        70002      10000       320000      101       3.120       6.060     5.000      0.000     20.000      34.180+
@@ -273,4 +273,16 @@ SELECT 'per_row_us = 10',
  per_row_us = 0  | mode=bloom
  per_row_us = 10 | mode=exact
 (2 rows)
+
+-- Step 20 (Batch 6b): sjb_plan_choice takes max_filter_bytes (default
+-- 1 MB), like sjb_build_auto. With 200000 keys on a 1 Mbit/s network the
+-- Bloom filter (about 200-400 KB) wins with the default limit. With a
+-- 64 KB limit neither BLOOM nor EXACT is allowed, only PASS (all 1,000,000
+-- rows come back), so the index path wins.
+SELECT sjb_plan_choice(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100) AS default_limit,
+       sjb_plan_choice(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100, 65536) AS limit_64kb;
+ default_limit | limit_64kb 
+---------------+------------
+ filter        | index
+(1 row)
 

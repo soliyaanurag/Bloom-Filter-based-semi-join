@@ -182,3 +182,11 @@ UNION ALL
 SELECT 'per_row_us = 10',
        split_part(sjb_info(sjb_build_auto(ARRAY(SELECT generate_series(1, 5000)), 1e6, 1, 30, 1000, 100,
                                           1048576, 2, 0, 10, 0, 100)), ' ', 1);
+
+-- Step 20 (Batch 6b): sjb_plan_choice takes max_filter_bytes (default
+-- 1 MB), like sjb_build_auto. With 200000 keys on a 1 Mbit/s network the
+-- Bloom filter (about 200-400 KB) wins with the default limit. With a
+-- 64 KB limit neither BLOOM nor EXACT is allowed, only PASS (all 1,000,000
+-- rows come back), so the index path wins.
+SELECT sjb_plan_choice(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100) AS default_limit,
+       sjb_plan_choice(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100, 65536) AS limit_64kb;

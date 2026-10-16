@@ -154,8 +154,10 @@ LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  *
  * n is the number of distinct keys. t_lookup_us is the index path's time
  * per key (calibrated end to end through postgres_fdw). The last four
- * arguments are as for sjb_build_auto. max_filter_bytes and wire_factor
- * are the defaults of sjb_build_auto (1 MB and 2).
+ * arguments are as for sjb_build_auto. max_filter_bytes (Batch 6b) is
+ * the largest BLOOM/EXACT filter allowed, as for sjb_build_auto; the
+ * planner hook passes postgres_fdw.semijoin_max_filter_kb * 1024 to both,
+ * so the two decisions use the same limit. wire_factor is 2 (hex text).
  */
 CREATE FUNCTION sjb_choice_report(n float8,
                                   s_rows float8,
@@ -167,7 +169,8 @@ CREATE FUNCTION sjb_choice_report(n float8,
                                   per_message_ms float8 DEFAULT 0.06194,
                                   per_row_us float8 DEFAULT 0.54819,
                                   t_build_us float8 DEFAULT 0.245,
-                                  fetch_size int4 DEFAULT 100)
+                                  fetch_size int4 DEFAULT 100,
+                                  max_filter_bytes int8 DEFAULT 1048576)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_choice_report'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -175,7 +178,7 @@ LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 /*
  * Step 7: sjb_plan_choice (Batch 5). The same estimates as
  * sjb_choice_report, but only the decision: 'index' or 'filter'. Batch 6's
- * planner hook will call it, so the decision lives in one place.
+ * planner hook calls it, so the decision lives in one place.
  */
 CREATE FUNCTION sjb_plan_choice(n float8,
                                 s_rows float8,
@@ -187,7 +190,8 @@ CREATE FUNCTION sjb_plan_choice(n float8,
                                 per_message_ms float8 DEFAULT 0.06194,
                                 per_row_us float8 DEFAULT 0.54819,
                                 t_build_us float8 DEFAULT 0.245,
-                                fetch_size int4 DEFAULT 100)
+                                fetch_size int4 DEFAULT 100,
+                                max_filter_bytes int8 DEFAULT 1048576)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_plan_choice'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

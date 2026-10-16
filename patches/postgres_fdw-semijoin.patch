@@ -314,10 +314,10 @@ index 81358f3bde..bcc2603dad 100644
  extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
 diff --git a/contrib/postgres_fdw/semijoin.c b/contrib/postgres_fdw/semijoin.c
 new file mode 100644
-index 0000000000..046407090e
+index 0000000000..a92dc262da
 --- /dev/null
 +++ b/contrib/postgres_fdw/semijoin.c
-@@ -0,0 +1,1607 @@
+@@ -0,0 +1,1701 @@
 +/*-------------------------------------------------------------------------
 + *
 + * semijoin.c
@@ -338,7 +338,8 @@ index 0000000000..046407090e
 + *   2. collect_remote_stats: size of S, rows per key, width of a row on
 + *      the wire (from site A's statistics of the foreign table).
 + *   3. estimate_local_keys: how many distinct keys n will the local rows
-+ *      have? (planner row estimate + Cardenas' formula)
++ *      have? (planner row estimate + the formula of PostgreSQL's
++ *      estimate_num_groups)
 + *   4. decide_path: index path or filter path (sjbloom's sjb_plan_choice,
 + *      or the setting postgres_fdw.semijoin_force_path).
 + *   5. the rewrite: one new condition on the foreign key is added to WHERE:
@@ -469,6 +470,7 @@ index 0000000000..046407090e
 +	int			num_columns;	/* foreign columns the query fetches */
 +	int			fetch_size;		/* rows per FETCH (postgres_fdw option) */
 +	double		r_local;		/* local rows after the local conditions */
++	double		n_local;		/* all rows of the local table (reltuples) */
 +	double		d_local;		/* distinct join keys in the local table */
 +	double		n_est;			/* estimated distinct keys we will send */
 +} SjbStats;
@@ -1437,16 +1439,53 @@ index 0000000000..046407090e
 + * the local rows R'.
 + *   1. r = the planner's row estimate for
 + *          SELECT key FROM local WHERE key IS NOT NULL AND <local conditions>
-+ *   2. D_local = number of distinct keys in the whole local table
-+ *   3. Cardenas' formula (A. F. Cardenas, "Analysis and Performance of
-+ *      Inverted Data Base Structures", CACM 18(5), 1975): if r rows are
-+ *      picked at random from a table with D distinct values, the expected
-+ *      number of distinct values among them is
-+ *          n = D * (1 - (1 - 1/D)^r)
-+ *      (each value is missed by one row with probability 1 - 1/D, so by
-+ *      all r rows with probability (1 - 1/D)^r).
++ *   2. N = all rows of the local table (reltuples), D = number of distinct
++ *      keys in the whole local table (n_distinct)
++ *   3. n_est = D * (1 - ((N - r) / N) ^ (N / D))
 + *
-+ * Inputs:  c - the candidate; stats - r_local, d_local, n_est are set
++ * This is the formula PostgreSQL itself uses in estimate_num_groups()
++ * (src/backend/utils/adt/selfuncs.c). Its comment there explains it:
++ *
++ *   "Given a table containing N rows with n distinct values in a
++ *    uniform distribution, if we select p rows at random then
++ *    the expected number of distinct values selected is
++ *
++ *    n * (1 - product((N-N/n-i)/(N-i), i=0..p-1))
++ *
++ *    = n * (1 - (N-N/n)! / (N-N/n-p)! * (N-p)! / N!)
++ *
++ *    See "Approximating block accesses in database
++ *    organizations", S. B. Yao, Communications of the ACM,
++ *    Volume 20 Issue 4, April 1977 Pages 260-261.
++ *
++ *    Alternatively, re-arranging the terms from the factorials,
++ *    this may be written as
++ *
++ *    n * (1 - product((N-p-i)/(N-i), i=0..N/n-1))
++ *
++ *    This form of the formula is more efficient to compute in
++ *    the common case where p is larger than N/n.  Additionally,
++ *    as pointed out by Dell'Era, if i << N for all terms in the
++ *    product, it can be approximated by
++ *
++ *    n * (1 - ((N-p)/N)^(N/n))
++ *
++ *    See "Expected distinct values when selecting from a bag
++ *    without replacement", Alberto Dell'Era,
++ *    http://www.adellera.it/investigations/distinct_balls/.
++ *
++ *    The condition i << N is equivalent to n >> 1, so this is a
++ *    good approximation when the number of distinct values in
++ *    the table is large.  It turns out that this formula also
++ *    works well even when n is small."
++ *
++ * (Their n is our D and their p is our r.) In Batch 6 we used Cardenas'
++ * formula D * (1 - (1 - 1/D)^r), which assumes the r rows are picked WITH
++ * replacement; it was 29% too low at r = 150,000 of N = 200,000 rows.
++ * Like PostgreSQL, we clamp D to N and use D itself when r >= N.
++ *
++ * Inputs:  c - the candidate; stats - r_local, n_local, d_local, n_est
++ *          are set
 + * Output:  none
 + *
 + * Why it exists: the real n is only known when the query runs, but the
@@ -1466,16 +1505,29 @@ index 0000000000..046407090e
 +	plan = standard_planner(query, sql, 0, NULL);
 +	stats->r_local = plan->planTree->plan_rows;
 +
++	stats->n_local = get_reltuples(c->local_relid);
 +	stats->d_local = get_n_distinct(c->local_relid, c->local_attno,
-+									get_reltuples(c->local_relid));
-+	if (stats->d_local <= 0)
++									stats->n_local);
++	if (stats->n_local <= 0 || stats->d_local <= 0)
 +	{
 +		/* no statistics: assume every row has its own key */
 +		stats->n_est = stats->r_local;
 +		return;
 +	}
-+	stats->n_est = stats->d_local *
-+		(1.0 - pow(1.0 - 1.0 / stats->d_local, stats->r_local));
++
++	/* there cannot be more distinct keys than rows */
++	if (stats->d_local > stats->n_local)
++		stats->d_local = stats->n_local;
++
++	if (stats->r_local < stats->n_local)
++		stats->n_est = stats->d_local *
++			(1.0 - pow((stats->n_local - stats->r_local) / stats->n_local,
++					   stats->n_local / stats->d_local));
++	else
++		stats->n_est = stats->d_local;	/* all rows: all keys */
++
++	if (stats->n_est < 1)
++		stats->n_est = 1;
 +}
 +
 +
@@ -1485,10 +1537,25 @@ index 0000000000..046407090e
 + */
 +
 +/*
++ * get_max_filter_bytes
++ *
++ * What it does: returns postgres_fdw.semijoin_max_filter_kb in bytes.
++ * Input:  none
++ * Output: the largest filter (BLOOM or EXACT) we may send, in bytes
++ * Why it exists: the same limit goes to sjb_plan_choice (plan time) and
++ * to sjb_build_auto (run time), so both decisions agree.
++ */
++static int64
++get_max_filter_bytes(void)
++{
++	return (int64) pgfdw_semijoin_max_filter_kb * 1024;
++}
++
++/*
 + * call_cost_function
 + *
 + * What it does: calls one of sjbloom's SQL functions sjb_plan_choice or
-+ * sjb_choice_report (they take the same 11 arguments, see
++ * sjb_choice_report (they take the same 12 arguments, see
 + * sjbloom--1.0.sql) directly through fmgr, PostgreSQL's function call
 + * interface, and returns the text result.
 + *
@@ -1503,31 +1570,32 @@ index 0000000000..046407090e
 +static char *
 +call_cost_function(SjbCandidate *c, const char *function_name, SjbStats *stats)
 +{
-+	Oid			argument_types[11];
++	Oid			argument_types[12];
 +	Oid			function_oid;
 +	FmgrInfo	function_info;
 +	Datum		result;
 +	int			i;
 +
-+	/* LOCAL_FCINFO declares a FunctionCallInfo with room for 11 arguments */
-+	LOCAL_FCINFO(fcinfo, 11);
++	/* LOCAL_FCINFO declares a FunctionCallInfo with room for 12 arguments */
++	LOCAL_FCINFO(fcinfo, 12);
 +
 +	for (i = 0; i < 10; i++)
 +		argument_types[i] = FLOAT8OID;
 +	argument_types[10] = INT4OID;	/* fetch_size */
++	argument_types[11] = INT8OID;	/* max_filter_bytes (Batch 6b) */
 +
 +	/* LookupFuncName finds a function by (schema, name) and argument types */
 +	function_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
 +											 makeString(pstrdup(function_name))),
-+								  11, argument_types, true);
++								  12, argument_types, true);
 +	if (!OidIsValid(function_oid))
 +		return NULL;
 +
-+	/* fmgr_info prepares the call; then we put the 11 arguments in place */
++	/* fmgr_info prepares the call; then we put the 12 arguments in place */
 +	fmgr_info(function_oid, &function_info);
-+	InitFunctionCallInfoData(*fcinfo, &function_info, 11, InvalidOid, NULL, NULL);
++	InitFunctionCallInfoData(*fcinfo, &function_info, 12, InvalidOid, NULL, NULL);
 +
-+	/* Float8GetDatum / Int32GetDatum wrap a C value as a Datum */
++	/* Float8GetDatum / Int32GetDatum / Int64GetDatum wrap a C value as a Datum */
 +	fcinfo->args[0].value = Float8GetDatum(stats->n_est);
 +	fcinfo->args[1].value = Float8GetDatum(stats->s_rows);
 +	fcinfo->args[2].value = Float8GetDatum(stats->rows_per_key);
@@ -1539,7 +1607,8 @@ index 0000000000..046407090e
 +	fcinfo->args[8].value = Float8GetDatum(pgfdw_semijoin_per_row_us);
 +	fcinfo->args[9].value = Float8GetDatum(pgfdw_semijoin_t_build_us);
 +	fcinfo->args[10].value = Int32GetDatum(stats->fetch_size);
-+	for (i = 0; i < 11; i++)
++	fcinfo->args[11].value = Int64GetDatum(get_max_filter_bytes());
++	for (i = 0; i < 12; i++)
 +		fcinfo->args[i].isnull = false;
 +
 +	result = FunctionCallInvoke(fcinfo);
@@ -1575,7 +1644,7 @@ index 0000000000..046407090e
 +	if (choice != NULL && strcmp(choice, "filter") == 0)
 +		return SEMIJOIN_PATH_FILTER;
 +
-+	c->reject_reason = "sjb_plan_choice could not be called (is sjbloom up to date?)";
++	c->reject_reason = "sjb_plan_choice(12 arguments) could not be called: recreate sjbloom from its current SQL file";
 +	return -1;
 +}
 +
@@ -1670,7 +1739,7 @@ index 0000000000..046407090e
 +{
 +	Oid			contains_argument_types[2] = {BYTEAOID, INT4OID};
 +	Oid			contains_oid;
-+	long long	max_filter_bytes = (long long) pgfdw_semijoin_max_filter_kb * 1024;
++	long long	max_filter_bytes = (long long) get_max_filter_bytes();
 +	char	   *build_call;
 +	Node	   *sublink;
 +
@@ -1733,12 +1802,13 @@ index 0000000000..046407090e
 +		winner_line = strstr(report, "winner:");
 +
 +	ereport(NOTICE,
-+			(errmsg("postgres_fdw semijoin: %s path (%s): n_est=%.1f (r=%.0f, D_local=%.0f), s_rows=%.0f, rows_per_key=%.3f, row_width=%.2f (%d columns), fetch_size=%d",
++			(errmsg("postgres_fdw semijoin: %s path (%s): n_est=%.1f (r=%.0f, N=%.0f, D_local=%.0f), s_rows=%.0f, rows_per_key=%.3f, row_width=%.2f (%d columns), fetch_size=%d, max_filter_bytes=%lld",
 +					path == SEMIJOIN_PATH_INDEX ? "index" : "filter",
 +					pgfdw_semijoin_force_path == SEMIJOIN_PATH_AUTO ? "cost model" : "forced",
-+					stats->n_est, stats->r_local, stats->d_local,
++					stats->n_est, stats->r_local, stats->n_local, stats->d_local,
 +					stats->s_rows, stats->rows_per_key, stats->row_width,
-+					stats->num_columns, stats->fetch_size),
++					stats->num_columns, stats->fetch_size,
++					(long long) get_max_filter_bytes()),
 +			 errdetail("cost model %s\nsub-SELECT: %s",
 +					   winner_line != NULL ? winner_line : "report not available",
 +					   sql)));
@@ -1812,13 +1882,6 @@ index 0000000000..046407090e
 +	ResourceOwner old_owner = CurrentResourceOwner;
 +	Node	   *condition = NULL;
 +
-+	/* subtransactions are not allowed in parallel mode: do nothing */
-+	if (IsInParallelMode())
-+	{
-+		c->reject_reason = "planning in parallel mode";
-+		return NULL;
-+	}
-+
 +	/*
 +	 * BeginInternalSubTransaction switches to the subtransaction's memory;
 +	 * we switch back, so that the new condition survives the end of the
@@ -1863,6 +1926,37 @@ index 0000000000..046407090e
 +}
 +
 +/*
++ * attach_condition
++ *
++ * What it does: the ONLY change we ever make to the user's query: it adds
++ * "AND <condition>" to WHERE. make_and_qual(a, b) builds "a AND b" (or
++ * just b if there was no WHERE).
++ *
++ * Inputs:  q - the user's query; condition - the finished new condition
++ * Output:  none (q is changed)
++ *
++ * Why it exists: it must be the very LAST step, run only after all steps
++ * that can fail (statistics, parsing, planning the estimate, the cost
++ * model) have finished. Those steps run in try_plan_semijoin, and if one
++ * fails its error is caught there and the query is planned without our
++ * condition. That is only correct if the query is then truly unchanged:
++ * a query changed halfway (for example a condition added but hasSubLinks
++ * not set) could give a wrong plan or a crash. So all earlier steps only
++ * READ q (local conditions are copied with copyObject before their Vars
++ * are renumbered, and the foreign Var is copied too), and here the new
++ * WHERE is first built completely and then stored with two plain
++ * assignments, which cannot fail.
++ */
++static void
++attach_condition(Query *q, Node *condition)
++{
++	Node	   *new_quals = make_and_qual(q->jointree->quals, condition);
++
++	q->jointree->quals = new_quals;
++	q->hasSubLinks = true;		/* the condition contains a sub-SELECT */
++}
++
++/*
 + * pgfdw_semijoin_planner
 + *
 + * What it does: our planner hook. PostgreSQL calls it for every query it
@@ -1881,7 +1975,16 @@ index 0000000000..046407090e
 +pgfdw_semijoin_planner(Query *parse, const char *query_string,
 +					   int cursorOptions, ParamListInfo boundParams)
 +{
-+	if (pgfdw_enable_semijoin && !in_semijoin_hook)
++	/*
++	 * In parallel mode (for example a parallel worker planning a query of a
++	 * function) we do nothing. Our rewrite runs in a subtransaction, and
++	 * PostgreSQL only allows subtransactions during a parallel operation if
++	 * they assign no new transaction ID or command ID (see
++	 * BeginInternalSubTransaction in src/backend/access/transam/xact.c);
++	 * breaking that rule is an error we could not hide. So we never start a
++	 * subtransaction there.
++	 */
++	if (pgfdw_enable_semijoin && !in_semijoin_hook && !IsInParallelMode())
 +	{
 +		SjbCandidate candidate;
 +		Node	   *condition = NULL;
@@ -1898,16 +2001,7 @@ index 0000000000..046407090e
 +				condition = try_plan_semijoin(parse, &candidate);
 +
 +			if (condition != NULL)
-+			{
-+				/*
-+				 * The only change to the user's query: "AND <condition>" in
-+				 * WHERE. make_and_qual(a, b) builds "a AND b" (or just b if
-+				 * there was no WHERE).
-+				 */
-+				parse->jointree->quals = make_and_qual(parse->jointree->quals,
-+													   condition);
-+				parse->hasSubLinks = true;
-+			}
++				attach_condition(parse, condition);	/* last step */
 +			else if (candidate.uses_foreign_table &&
 +					 (pgfdw_semijoin_verbose || candidate.always_report))
 +				ereport(NOTICE,

@@ -1115,6 +1115,8 @@ DETAIL:  cost model winner: filter path with bloom (289.421 ms < 477.191 ms for 
 
 ### Cardenas' formula: how many distinct keys will we send?
 
+*(Batch 6b replaced this formula with PostgreSQL's own, see below. This section shows what Batch 6 did.)*
+
 The planner only estimates **rows** (r), but the filter and the key list depend on **distinct keys** (n). Cardenas (A. F. Cardenas, "Analysis and Performance of Inverted Data Base Structures", CACM 18(5), 1975) gives the expected number of distinct values when r rows are picked from a column with D distinct values:
 
 ```
@@ -1144,7 +1146,7 @@ At n = 150000 the estimate is 29% too low, for two reasons. ANALYZE's D (168,392
 ### Known limitations (version 1)
 
 - Queries with parameters in local conditions (`$1` of a prepared statement, PL/pgSQL variables) are not rewritten.
-- `sjb_plan_choice` has no max_filter_bytes argument and always assumes 1 MB. `semijoin_max_filter_kb` only reaches `sjb_build_auto`. With the default (1024 kB) the two agree.
+- ~~`sjb_plan_choice` has no max_filter_bytes argument and always assumes 1 MB.~~ Fixed in Batch 6b.
 - A foreign column that is used only in a condition shipped to site B (e.g. `c.city = 'X'`) is counted in `row_width`, although postgres_fdw does not fetch it. The width is then a little too high.
 
 ### How to test it
@@ -1159,3 +1161,118 @@ psql -X -d site_a -f queries/correctness_auto.sql   # about 50 s; every off_exce
 `correctness_auto.sql` runs a join query and a GROUP BY query (`c.city, count(*), sum(o.amount)`) for n = 100, 10000 and 150000, each with `semijoin_force_path` = auto, index and filter. Each query runs into a temp table with the rewrite off and again with it on, and the two tables are compared with EXCEPT ALL in both directions. (A single `query EXCEPT ALL query` is a set operation, which the hook never rewrites.) All 18 comparisons gave 0 and 0.
 
 To see a decision, run `SET postgres_fdw.semijoin_verbose = on;` and then `EXPLAIN (VERBOSE)` of the plain query. To compare with the original behaviour, run `SET postgres_fdw.enable_semijoin = off;`.
+
+## Batch 6b: safety fixes and a better key estimate
+
+Four small fixes to `contrib/postgres_fdw/semijoin.c` (branch `cs631-semijoin`, commit `2c357700f4`) and one to sjbloom. After that, postgres_fdw's own regression suite was run.
+
+### 1. The query is never left half-rewritten
+
+The hook catches errors (see Batch 6). That is only correct if a caught error leaves the user's query **truly unchanged**. A query changed halfway, for example with the condition added but `hasSubLinks` not set, could get a wrong plan or crash the planner. We checked every place that writes to the Query:
+
+- steps 2–5 only **read** it. The local conditions are copied with `copyObject` before their Vars are renumbered (`ChangeVarNodes` works on the copy). The foreign Var is copied into the new condition. The sub-SELECTs are new Query trees parsed from text;
+- the only writes are in the new function **`attach_condition`**, the very last step. It runs only after `try_plan_semijoin` has finished successfully. It first builds the new WHERE completely (`make_and_qual`) and then stores it with two plain assignments (`quals` and `hasSubLinks = true`), which cannot fail.
+
+So the code already followed rule (b): attaching is the last step and nothing after it can fail. Batch 6b makes this explicit with its own function and a comment that explains why.
+
+### 2. Parallel mode
+
+The hook now does nothing when `IsInParallelMode()`, for example in a parallel worker that plans a query inside a function, so it never starts a subtransaction there. Before, the check was inside `try_plan_semijoin`. A detail: PostgreSQL 18 does not forbid every subtransaction during a parallel operation. `BeginInternalSubTransaction` (src/backend/access/transam/xact.c) says: *"It's permissible to start and end "internal" subtransactions while in parallel mode, so long as no new XIDs or command IDs are assigned."* We cannot promise that for parse analysis and planning, and breaking the rule would be an error we could not hide, so we skip the rewrite.
+
+### 3. The distinct-key estimate: PostgreSQL's own formula
+
+Cardenas' formula (Batch 6) was 29% too low at n = 150000. Now `estimate_local_keys` uses the formula from `estimate_num_groups()` in `src/backend/utils/adt/selfuncs.c`, the one PostgreSQL uses for its own GROUP BY / DISTINCT estimates:
+
+```
+n_est = D * (1 - ((N - r) / N) ^ (N / D))
+N = local reltuples, r = estimated rows after WHERE, D = local n_distinct
+```
+
+This is the explanation from selfuncs.c's comment, quoted exactly (their n is our D, their p is our r):
+
+> Given a table containing N rows with n distinct values in a uniform distribution, if we select p rows at random then the expected number of distinct values selected is
+>
+>     n * (1 - product((N-N/n-i)/(N-i), i=0..p-1))
+>
+>     = n * (1 - (N-N/n)! / (N-N/n-p)! * (N-p)! / N!)
+>
+> See "Approximating block accesses in database organizations", S. B. Yao, Communications of the ACM, Volume 20 Issue 4, April 1977 Pages 260-261.
+>
+> Alternatively, re-arranging the terms from the factorials, this may be written as
+>
+>     n * (1 - product((N-p-i)/(N-i), i=0..N/n-1))
+>
+> This form of the formula is more efficient to compute in the common case where p is larger than N/n.  Additionally, as pointed out by Dell'Era, if i << N for all terms in the product, it can be approximated by
+>
+>     n * (1 - ((N-p)/N)^(N/n))
+>
+> See "Expected distinct values when selecting from a bag without replacement", Alberto Dell'Era, http://www.adellera.it/investigations/distinct_balls/.
+>
+> The condition i << N is equivalent to n >> 1, so this is a good approximation when the number of distinct values in the table is large.  It turns out that this formula also works well even when n is small.
+
+In plain words: each of the D values occurs about N/D times in the table. We pick r of the N rows **without replacement**. A value is missed only if all of its N/D rows are among the N − r rows we did not pick, which happens with probability about ((N − r)/N)^(N/D). Cardenas' formula assumed picking *with* replacement from D equally likely values. That is wrong when r is a large part of the table: when r = N, Cardenas still says only 1 − e^(−N/D) of the values, while this formula gives all D. Like PostgreSQL, we clamp D to N and use D itself when r ≥ N.
+
+**Worked example (n = 150000):** N = 200,000, r = 150,166, D = 168,392.
+- (N − r)/N = 49,834 / 200,000 = 0.24917, and N/D = 1.18771
+- 0.24917^1.18771 = e^(1.18771 · ln 0.24917) = e^(1.18771 · (−1.38962)) = e^(−1.65047) ≈ 0.19196
+- n_est = 168,392 · (1 − 0.19196) ≈ **136,067**. The true number is 139,294.
+
+Old vs new vs true (r from the planner, N and D from the statistics of orders):
+
+| n (order_id <=) | r | Cardenas (Batch 6) | PostgreSQL formula (6b) | true distinct keys |
+|---|---|---|---|---|
+| 100 | 95 | 95.0 | 95.0 | 100 |
+| 1000 | 952 | 949.3 | 951.6 | 999 |
+| 10000 | 10351 | 10039.3 | 10300.0 | 9955 |
+| 100000 | 100951 | 75930.5 | 95302.0 | 95017 |
+| 150000 | 150166 | 99362.9 | 136067.2 | 139294 |
+
+The remaining error comes mostly from r (the planner's row estimate) and from D: ANALYZE's n_distinct is 168,392, against 181,329 true. The paths chosen did not change: index for n ≤ 10000, filter (Bloom) for n ≥ 100000.
+
+### 4. One filter-size limit for both decisions
+
+`sjb_plan_choice` and `sjb_choice_report` (sjbloom) have a new last argument **`max_filter_bytes int8 DEFAULT 1048576`**, the same limit `sjb_build_auto` already had. Existing calls keep working because of the default. The hook passes `postgres_fdw.semijoin_max_filter_kb * 1024` to both the plan-time choice and the run-time `sjb_build_auto` (one helper, `get_max_filter_bytes`). The report's inputs line now shows `max_filter_bytes`. sjbloom's regression test has a new Step 20: 200,000 keys at 1 Mbit/s give `filter` with the default limit and `index` with a 64 KB limit. sjbloom must be recreated in both sites (`DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom;`). With an old sjbloom, the hook cannot find the 12-argument function and leaves the query unchanged.
+
+A case where the limit changes the path (n = 100000):
+
+```
+SET postgres_fdw.semijoin_max_filter_kb = 1024;   -- default
+NOTICE:  ... filter path (cost model): n_est=95302.0 ..., max_filter_bytes=1048576
+DETAIL:  cost model winner: filter path with bloom (322.786 ms < 598.923 ms for index path)
+         Remote SQL: SELECT customer_id, name FROM public.customers WHERE (public.sjb_contains($1::bytea, customer_id))
+
+SET postgres_fdw.semijoin_max_filter_kb = 64;
+NOTICE:  ... index path (cost model): n_est=95302.0 ..., max_filter_bytes=65536
+DETAIL:  cost model winner: index path (598.923 ms <= 1613.191 ms for filter path with pass)
+         Remote SQL: SELECT customer_id, name FROM public.customers WHERE ((customer_id = ANY ($1::integer[])))
+```
+
+The Bloom filter for about 95,000 keys is larger than 64 KB, and so is the EXACT list. Only PASS is left on the filter path, and PASS returns all 1,000,000 rows.
+
+### 5. postgres_fdw's own regression suite
+
+```
+make -C ~/postgres/postgresql/contrib/postgres_fdw installcheck
+ok 1         - postgres_fdw                             3297 ms
+ok 2         - query_cancel                               22 ms
+# All 2 tests passed.
+ok 1         - eval_plan_qual                            109 ms
+# All 1 tests passed.
+TAP tests not enabled. Try configuring with --enable-tap-tests
+```
+
+All original tests pass with our hook installed and the feature on by default, because the test servers do not set `semijoin_filter`. The expected files were not touched. The TAP tests did not run, because this source tree was configured without `--enable-tap-tests`. installcheck leaves its database `contrib_regression` on the server; it can be dropped.
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom && make -C sjbloom install
+for db in site_a site_b; do psql -X -d $db -c "DROP EXTENSION sjbloom CASCADE" -c "CREATE EXTENSION sjbloom"; done
+make -C sjbloom installcheck                                          # 1 test, ok
+make -C ~/postgres/postgresql/contrib/postgres_fdw && make -C ~/postgres/postgresql/contrib/postgres_fdw install
+make -C ~/postgres/postgresql/contrib/postgres_fdw installcheck       # 3 tests, ok
+psql -X -d site_a -f queries/correctness_auto.sql                     # 18 x (0, 0)
+```
+
+The patch was re-exported (`patches/postgres_fdw-semijoin.patch`, base `a85b5523e6`). `git apply --check` against plain `REL_18_6` again reports no errors.
