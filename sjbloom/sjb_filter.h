@@ -23,8 +23,22 @@
 #ifndef SJB_FILTER_H
 #define SJB_FILTER_H
 
-/* Version number stored in every filter header. */
-#define SJB_VERSION 1
+/*
+ * Version number stored in every filter header.
+ *
+ * Site A builds the filter and site B tests keys against it, so both must
+ * compute the SAME k bit positions for a key. If they used different
+ * algorithms, B would look at the wrong bits and could wrongly drop
+ * matching rows (false negatives), and the join result would silently be
+ * wrong. So whenever the bit positions or the layout change, this number
+ * goes up, and a filter with a different version is rejected with a clear
+ * error (see read_header in sjbloom.c), never read with the wrong
+ * positions.
+ *
+ *   1 = classic double hashing,  position_i = (h1 + i*h2) mod m
+ *   2 = enhanced double hashing  (see compute_positions in bloom.c)
+ */
+#define SJB_VERSION 2
 
 /* The three filter modes (stored in the "mode" field of the header). */
 #define SJB_MODE_BLOOM 1

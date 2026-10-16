@@ -23,11 +23,15 @@ A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chose
 - Our extension is named `sjbloom`. It is installed in BOTH site_a and site_b, in schema public. It stays at version 1.0. After changing its SQL file, recreate it with DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom; (no upgrade scripts).
 - Version 1 supports only: INNER JOIN, one equality join condition, int4 join keys.
 - Hashing: always use PostgreSQL's own hash function hashint4extended(key, seed) via DirectFunctionCall2. Never hash raw bytes.
-- The k bit positions come from double hashing: h1 = low 32 bits of the hash, h2 = (high 32 bits) | 1, position_i = (h1 + i*h2) mod m, for i = 0..k-1.
+- The k bit positions come from ENHANCED double hashing (Dillinger & Manolios, "Bloom Filters in Probabilistic Verification", FMCAD 2004; the same method as PostgreSQL's src/backend/lib/bloomfilter.c), with ONE hash call per key: h1 = low 32 bits of the hash, h2 = (high 32 bits) | 1. Start at x = h1 mod m with a step y = h2 mod m. Position 0 is x. For each next position i = 1..k-1: move forward by the step (x = (x + y) mod m), then make the step i bigger (y = (y + i) mod m). Because the step keeps growing, the positions are not evenly spaced, unlike classic double hashing (h1 + i*h2) mod m, which gave far too many false positives for small m.
+- The filter header's version is SJB_VERSION = 2 (version 1 was classic double hashing). Site A and site B must compute the same positions, so a filter with another version is rejected with a clear error, never read with the wrong positions. Bump SJB_VERSION whenever the positions or the layout change.
 - A filter is a bytea: a 24-byte header, then a payload. The header holds version uint8, mode uint8, k uint16, nkeys uint32, m uint64, seed uint64. Always read/write the header with memcpy, never by casting pointers.
+- False-positive model: ONLY the standard formula predicted_fp = (1 - exp(-k*n/m))^k (Broder & Mitzenmacher, "Network Applications of Bloom Filters: A Survey", 2004). sjb_best_bits uses its best-k form, e^(-(ln 2)^2 * b).
+- At small m the measured FP rate is above this formula (a known effect of double hashing, see Kirsch & Mitzenmacher, "Less Hashing, Same Performance", 2006). This is documented in docs/fp_investigation.md as a limitation and is NOT modelled.
 - Modes: 1 = BLOOM (payload = ceil(m/8) bytes of bits), 2 = EXACT (payload = sorted, unique int4 keys), 3 = PASS (no payload; every key passes).
 - The filter SQL functions are IMMUTABLE STRICT PARALLEL SAFE. postgres_fdw only ships immutable functions to the remote server, and STRICT gives correct NULL handling automatically.
 - postgres_fdw sends query parameters as TEXT: a bytea filter travels as hex text (2 bytes per filter byte, plus "\x"), and an int4[] travels as text like {12,345}. Rows also come back as text. All byte estimates must use these text sizes.
+- The cost model's GOAL is estimated TIME, not bytes: time = bytes / bandwidth + work at site B (communication cost + processing cost, as in Ozsu & Valduriez, "Principles of Distributed Database Systems"). Details come in Batch 5.
 - The correctness test for every strategy: (baseline EXCEPT ALL new) and (new EXCEPT ALL baseline) must both return 0 rows.
 
 ## Coding style (VERY IMPORTANT: the team are beginners)
@@ -47,7 +51,7 @@ A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chose
 - If a check fails, do not hack around it. Show me the output and explain what you think is wrong.
 
 ## Current status and lessons learned
-- Batches 0, 1, 2, 3 and 4 are done and committed. The mid-sem charts and CSVs are in docs/midsem/ (results/ stays in .gitignore). Next is a short false-positive investigation (branch fp-investigation), then Batch 5.
+- Batches 0, 1, 2, 3 and 4 are done and committed. The mid-sem charts and CSVs are in docs/midsem/ (results/ stays in .gitignore). The false-positive investigation is done (enhanced double hashing, see docs/fp_investigation.md; the old Batch 4 charts are kept in docs/midsem/v1/). Next is Batch 5.
 - postgres_fdw was installed by the user from the source tree. Do not reinstall it, and never touch ~/postgres/postgresql.
 - `= ANY` with a sub-SELECT needs an `::int[]` cast: `= ANY ((SELECT array_agg(...) ...)::int[])`. Without it, PostgreSQL treats the subquery as a row set and fails with "operator does not exist: integer = integer[]".
 - In test queries, build filters in a `WITH ... AS MATERIALIZED` CTE so they are built once, not once per row.

@@ -551,3 +551,32 @@ bench/run_all.sh
 This needs the server running (`pg_ctl status`), both sites set up (`setup/setup_all.sh`), and the `.venv` from above. It takes about 5 minutes. It runs `run_experiments.py` (appends to `results/results.csv`), `b_sweep.py` (rewrites `results/b_sweep.csv`) and `plot.py` (rewrites the PNGs and `results/fp_rate.csv`). To start results.csv fresh, delete it first. The scripts can also be run one at a time, e.g. `.venv/bin/python bench/plot.py`.
 
 `results/` is in `.gitignore`, so each run writes there without touching git. A frozen copy of the mid-sem CSVs and charts is committed in `docs/midsem/`.
+
+## Between Batch 4 and Batch 5: enhanced double hashing
+
+The full story, with tables and references, is in **[docs/fp_investigation.md](fp_investigation.md)** (written as presentation material). In short: for small filters we measured far more false positives than theory (215 instead of about 3 at n = 100). The cause was classic double hashing, position_i = (h1 + i·h2) mod m. Its evenly spaced positions let different keys share the same bits.
+
+### What changed
+
+**`sjbloom/bloom.c`**: `bit_position` was replaced by **`compute_positions`**, which uses *enhanced double hashing* (Dillinger & Manolios 2004, also used by PostgreSQL's own `bloomfilter.c`): start at `x = h1 mod m` with step `y = h2 mod m`; for each next position take the step (`x = x + y`) and then make the step bigger (`y = y + i`), all mod m. There is still one hash call per key. The description of `bit_position` in the Batch 2 section above is the old version 1.
+
+**`sjbloom/sjb_filter.h`**: `SJB_VERSION` is now **2**. Site A and site B must compute the same positions; a filter from old code must never be read with the new positions, or matching rows could be dropped.
+
+**`sjbloom/sjbloom.c`**: `read_header` now rejects a filter of another version with a clear message and a HINT ("Site A and site B must run the same sjbloom build...").
+
+**`queries/fp_cases.sql`**: predicted vs measured false positives for the small filters of the benchmark, with synthetic keys and with the real order keys. Step 3 counts the non-members that get exactly the same positions as a member, which explains the gap that remains at very small m.
+
+Since the bit positions changed, some exact numbers in earlier sections changed too, for example `sjb_info(sjb_build(ARRAY[1,2,3], 64, 3))` now prints `bits_set=14.06%` instead of `12.50%`. The Batch 4 charts made with version 1 are kept in `docs/midsem/v1/`; `docs/midsem/` has the new ones.
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom && make -C sjbloom install && make -C sjbloom installcheck
+psql -d site_b -c "DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom;"
+psql -d site_a -c "DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom;"
+psql -X -d site_a -f queries/fp_rate.sql
+psql -X -d site_a -f queries/fp_cases.sql
+# An old (version 1) filter must be refused:
+psql -d site_a -c "SELECT sjb_contains(set_byte(sjb_build(ARRAY[1,2,3], 64, 3), 0, 1), 2);"
+```

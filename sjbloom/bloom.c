@@ -15,6 +15,10 @@
  *
  * Bit position p lives in byte p / 8, at bit p % 8 inside that byte.
  *
+ * The k positions of a key come from ONE hash call, using "enhanced
+ * double hashing" (Dillinger & Manolios, FMCAD 2004), the same method as
+ * PostgreSQL's own src/backend/lib/bloomfilter.c. See compute_positions.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -36,9 +40,10 @@
  * Output:  *h1 = low 32 bits of the hash
  *          *h2 = high 32 bits of the hash, with the lowest bit forced to 1
  *
- * Why it exists: double hashing (see bit_position below) needs two hash
- * values. Forcing h2 to be odd makes sure h2 is never 0, so the k
- * positions do not all collapse onto the same bit.
+ * Why it exists: enhanced double hashing (see compute_positions below)
+ * needs two hash values. Forcing h2 to be odd is not required by
+ * enhanced double hashing, but it is harmless and we keep it so the
+ * hashing step stays exactly as in our measurements.
  *
  * We use hashint4extended (the same function PostgreSQL uses for hash
  * indexes on int4) so that site A and site B always get the same hash for
@@ -66,28 +71,45 @@ compute_two_hashes(int32 key, uint64 seed, uint32 *h1, uint32 *h2)
 }
 
 /*
- * bit_position
+ * compute_positions
  *
- * What it does: returns the i-th bit position for a key, using
- * double hashing:  position_i = (h1 + i * h2) mod m
+ * What it does: fills positions[0 .. k-1] with the k bit positions of a
+ * key, using ENHANCED double hashing:
+ *     x = h1 mod m,  y = h2 mod m
+ *     position_0 = x
+ *     for i = 1 .. k-1:   x = (x + y) mod m      (take a step of size y)
+ *                         y = (y + i) mod m      (the next step is i bigger)
+ *                         position_i = x
  *
- * Inputs:  h1, h2 - the two hash values from compute_two_hashes
- *          i      - which position we want (0 .. k-1)
- *          m      - the number of bits in the filter
- * Output:  a bit position between 0 and m-1
+ * Inputs:  h1, h2    - the two hash values from compute_two_hashes
+ *          k         - number of positions (1 .. SJB_MAX_K)
+ *          m         - number of bits in the filter
+ * Output:  positions - array of at least k entries, filled in
  *
- * Why it exists: hashing a key k separate times would be slow. Double
- * hashing gives k well-spread positions from just one hash call.
- * All arithmetic is done in uint64, so h1 + i * h2 cannot overflow
- * (h1 and h2 are below 2^32 and i is at most 31).
+ * Why it exists: classic double hashing, position_i = (h1 + i*h2) mod m,
+ * puts the k positions at evenly spaced steps. Two keys with the same step
+ * and nearby starting points then share most of their bits, which gave
+ * up to about 70 times more false positives than theory for small filters (see
+ * docs/fp_investigation.md). Growing the step by 1, 2, 3, ... breaks that
+ * even spacing. This follows k_hashes() in PostgreSQL's bloomfilter.c,
+ * which uses "& (m - 1)" because its m is always a power of two; our m can
+ * be any number, so we use "% m". All values stay below m, so x + y and
+ * y + i cannot overflow a uint64.
  */
-static uint64
-bit_position(uint32 h1, uint32 h2, int i, uint64 m)
+static void
+compute_positions(uint32 h1, uint32 h2, int k, uint64 m, uint64 *positions)
 {
-	uint64		combined;
+	uint64		x = (uint64) h1 % m;
+	uint64		y = (uint64) h2 % m;
+	int			i;
 
-	combined = (uint64) h1 + (uint64) i * (uint64) h2;
-	return combined % m;
+	positions[0] = x;
+	for (i = 1; i < k; i++)
+	{
+		x = (x + y) % m;
+		y = (y + (uint64) i) % m;
+		positions[i] = x;
+	}
 }
 
 /*
@@ -136,7 +158,7 @@ bit_is_set(const uint8 *bits, uint64 position)
  *
  * Inputs:  bits - the bit array, (m + 7) / 8 bytes long
  *          m    - the number of bits in the filter (at least 1)
- *          k    - how many bits to set per key
+ *          k    - how many bits to set per key (1 .. SJB_MAX_K)
  *          seed - the hash seed
  *          key  - the key to add
  * Output:  none (the bit array is changed)
@@ -148,16 +170,14 @@ sjb_bloom_add(uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
 {
 	uint32		h1;
 	uint32		h2;
+	uint64		positions[SJB_MAX_K];
 	int			i;
 
 	compute_two_hashes(key, seed, &h1, &h2);
+	compute_positions(h1, h2, k, m, positions);
 
 	for (i = 0; i < k; i++)
-	{
-		uint64		position = bit_position(h1, h2, i, m);
-
-		set_bit(bits, position);
-	}
+		set_bit(bits, positions[i]);
 }
 
 /*
@@ -178,15 +198,15 @@ sjb_bloom_test(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
 {
 	uint32		h1;
 	uint32		h2;
+	uint64		positions[SJB_MAX_K];
 	int			i;
 
 	compute_two_hashes(key, seed, &h1, &h2);
+	compute_positions(h1, h2, k, m, positions);
 
 	for (i = 0; i < k; i++)
 	{
-		uint64		position = bit_position(h1, h2, i, m);
-
-		if (!bit_is_set(bits, position))
+		if (!bit_is_set(bits, positions[i]))
 			return false;
 	}
 

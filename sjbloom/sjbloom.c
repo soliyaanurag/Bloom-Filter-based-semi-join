@@ -112,11 +112,20 @@ read_header(const char *filter_data, Size filter_size, SjbHeader *header)
 
 	memcpy(header, filter_data, sizeof(SjbHeader));
 
+	/*
+	 * A filter of another version was built with a different algorithm
+	 * (for example version 1 = classic double hashing). Reading it with our
+	 * bit positions could drop rows that really match, so we refuse it.
+	 * This happens when site A and site B run different builds of sjbloom.
+	 * errhint adds a "HINT:" line that tells the user how to fix it.
+	 */
 	if (header->version != SJB_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("sjbloom: unknown filter version %d (expected %d)",
-						header->version, SJB_VERSION)));
+				 errmsg("sjbloom: filter has version %d, but this sjbloom understands only version %d",
+						header->version, SJB_VERSION),
+				 errhint("Site A and site B must run the same sjbloom build. "
+						 "Install it on both sites and rebuild the filter.")));
 }
 
 /*
