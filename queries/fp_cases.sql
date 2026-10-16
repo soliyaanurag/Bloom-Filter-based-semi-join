@@ -83,14 +83,15 @@ ORDER BY n;
 -- pair equals a member's pair gets exactly the same k positions, so it is
 -- ALWAYS a false positive, however large k is. Here we count those keys
 -- directly from hashint4extended (same seed as SJB_SEED = 0x5EED5EED).
--- Expected count = 1,000,000 * n / (number of possible pairs), with
--- m*m/2 pairs when m is even (h2 is forced odd, so h2 mod m is odd).
+-- Expected count = 1,000,000 * n / (number of possible pairs) = 1,000,000 * n / m^2.
+-- (Filter version 2 forced h2 odd, which left only m^2 / 2 pairs when m was
+-- even and doubled this count.)
 -- Step 3a: h1 and h2 of every key (as in compute_two_hashes in bloom.c).
 -- "& 4294967295" keeps the low 32 bits as a positive number.
 CREATE TEMP TABLE fp_hash_parts AS
     SELECT key,
            h & 4294967295 AS h1,
-           ((h >> 32) & 4294967295) | 1 AS h2
+           (h >> 32) & 4294967295 AS h2
     FROM (SELECT key, hashint4extended(key, 1592614637) AS h
           FROM generate_series(1, 1001000) AS key) AS hashed;
 
@@ -110,7 +111,7 @@ SELECT c.n, c.m,
           AND EXISTS (SELECT 1 FROM fp_patterns AS r
                       WHERE r.n = c.n AND r.key <= c.n AND r.x = q.x AND r.y = q.y)
        ) AS same_positions_as_a_member,
-       round(1000000 * c.n / (c.m::numeric * c.m / 2), 1) AS expected
+       round(1000000 * c.n / (c.m::numeric * c.m), 1) AS expected
 FROM (VALUES (100, 2640), (1000, 21600)) AS c(n, m)
 ORDER BY c.n;
 

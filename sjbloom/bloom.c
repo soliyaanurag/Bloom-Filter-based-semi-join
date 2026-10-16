@@ -38,12 +38,21 @@
  * Inputs:  key  - the join key to hash
  *          seed - the hash seed (taken from the filter header)
  * Output:  *h1 = low 32 bits of the hash
- *          *h2 = high 32 bits of the hash, with the lowest bit forced to 1
+ *          *h2 = high 32 bits of the hash
  *
  * Why it exists: enhanced double hashing (see compute_positions below)
- * needs two hash values. Forcing h2 to be odd is not required by
- * enhanced double hashing, but it is harmless and we keep it so the
- * hashing step stays exactly as in our measurements.
+ * needs two hash values.
+ *
+ * h2 is NOT forced to be odd (filter version 3; version 2 used h2 | 1).
+ * Classic double hashing needs an odd step so that its evenly spaced walk
+ * does not come back to the same bits, but enhanced double hashing changes
+ * the step every time, so it does not need that. PostgreSQL's
+ * bloomfilter.c does not force it either. Forcing it odd wasted one bit
+ * of the hash: when m is even, h2 mod m could only be odd, so only half
+ * of the possible (h1 mod m, h2 mod m) pairs were used, which doubled the
+ * extra false positives of small filters (see docs/fp_investigation.md).
+ * h2 mod m may now be 0; then position 1 equals position 0, and the walk
+ * still moves on because the step grows by 1, 2, 3, ...
  *
  * We use hashint4extended (the same function PostgreSQL uses for hash
  * indexes on int4) so that site A and site B always get the same hash for
@@ -67,7 +76,7 @@ compute_two_hashes(int32 key, uint64 seed, uint32 *h1, uint32 *h2)
 	hash = DatumGetUInt64(hash_datum);
 
 	*h1 = (uint32) (hash & 0xFFFFFFFF);
-	*h2 = ((uint32) (hash >> 32)) | 1;
+	*h2 = (uint32) (hash >> 32);
 }
 
 /*

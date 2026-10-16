@@ -36,9 +36,11 @@
  * positions.
  *
  *   1 = classic double hashing,  position_i = (h1 + i*h2) mod m
- *   2 = enhanced double hashing  (see compute_positions in bloom.c)
+ *   2 = enhanced double hashing  (see compute_positions in bloom.c),
+ *       with h2 forced odd (h2 | 1)
+ *   3 = enhanced double hashing, h2 NOT forced odd (as in PostgreSQL)
  */
-#define SJB_VERSION 2
+#define SJB_VERSION 3
 
 /* The three filter modes (stored in the "mode" field of the header). */
 #define SJB_MODE_BLOOM 1

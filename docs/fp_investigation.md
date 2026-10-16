@@ -1,4 +1,4 @@
-<!-- Presentation material: why our Bloom filter had too many false positives for small filters, and how enhanced double hashing fixed most of it. -->
+<!-- Presentation material: why our Bloom filter had too many false positives for small filters, and how enhanced double hashing (and an unforced step) fixed most of it. -->
 
 # False-positive investigation: classic vs. enhanced double hashing
 
@@ -22,7 +22,7 @@ The gap only shows up when the filter is **small** (m = 2,640 bits for n = 100).
 
 ## 2. How a key gets its k bit positions
 
-We hash each key **once** with PostgreSQL's `hashint4extended` and split the 64-bit result into two 32-bit numbers: `h1` (low half) and `h2` (high half, forced odd). The k positions are then computed from h1 and h2.
+We hash each key **once** with PostgreSQL's `hashint4extended` and split the 64-bit result into two 32-bit numbers: `h1` (low half) and `h2` (high half). The k positions are then computed from h1 and h2.
 
 ### Classic double hashing (our version 1)
 
@@ -44,7 +44,7 @@ Example with m = 20, k = 5, step h2 = 5:
 
 B is a false positive **every time** A is in the filter.
 
-### Enhanced double hashing (our version 2, now the only algorithm)
+### Enhanced double hashing (our versions 2 and 3; version 3 is the only one in use now)
 
 This is the method of Dillinger & Manolios (FMCAD 2004). PostgreSQL uses it too, in `src/backend/lib/bloomfilter.c` (function `k_hashes`). In simple words: **take a step, then make the next step a little bigger**.
 
@@ -67,67 +67,75 @@ The steps grow by 1, 2, 3, ..., so the positions are **no longer evenly spaced**
 
 It costs nothing extra: still **one hash call per key**, and k additions instead of k multiplications. PostgreSQL computes "mod m" with a bit mask because its m is always a power of two. Our m can be any number, so we use `%`.
 
-## 3. Results: version 1 vs. version 2
+### Version 2 vs. version 3: is the step forced odd?
 
-False positives among **1,000,000** keys that are not in the filter. m = ceil(n·b), k = round(0.693·b), so everything except the position formula is identical. Filter keys are 1..n, and the tested keys are n+1 .. n+1,000,000.
+Versions 1 and 2 forced h2 to be odd (`h2 | 1`). Classic double hashing needs that: with an even step and an even m, its evenly spaced walk comes back to the same bits. Enhanced double hashing changes the step every time, so it does **not** need an odd step, and PostgreSQL's `bloomfilter.c` does not force it either. Forcing it odd has a cost. When m is even, h2 mod m can then only be odd, so only half of the possible (h1 mod m, h2 mod m) pairs are ever used (see section 4). **Version 3** is enhanced double hashing with h2 *not* forced odd, as in PostgreSQL.
 
-| n | b | m | k | predicted (formula) | measured v1 (classic) | measured v2 (enhanced) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 100 | 26.4 | 2,640 | 18 | 3.1 | 170 | **29** |
-| 1,000 | 21.6 | 21,600 | 15 | 31.1 | 51 | **29** |
-| 10,000 | 16.8 | 168,000 | 12 | 313.0 | 342 | **355** |
-| 10,000 | 10.0 | 100,000 | 7 | 8,193.7 | 7,906 | **8,140** |
+| version | positions | step h2 |
+|---|---|---|
+| 1 | classic: (h1 + i·h2) mod m | forced odd |
+| 2 | enhanced (step grows by 1, 2, 3, ...) | forced odd |
+| **3** (current) | enhanced | **not** forced odd |
+
+## 3. Results: version 1 → version 2 → version 3
+
+False positives among **1,000,000** keys that are not in the filter. m = ceil(n·b), k = round(0.693·b), so everything except the position rule is identical. Filter keys are 1..n, and the tested keys are n+1 .. n+1,000,000.
+
+| n | b | m | k | predicted (formula) | v1 (classic) | v2 (enhanced, odd step) | v3 (enhanced) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 26.4 | 2,640 | 18 | 3.1 | 170 | 29 | **14** |
+| 1,000 | 21.6 | 21,600 | 15 | 31.1 | 51 | 29 | **35** |
+| 10,000 | 16.8 | 168,000 | 12 | 313.0 | 342 | 355 | **300** |
+| 10,000 | 10.0 | 100,000 | 7 | 8,193.7 | 7,906 | 8,140 | **8,363** |
 
 The same check with the **real** benchmark keys (the distinct customer_ids of the first n orders, tested against all other customer ids). v1 reproduces the Batch 4 numbers exactly (215 and 78):
 
-| n | b | distinct keys | m | k | predicted | measured v1 | measured v2 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 100 | 26.4 | 100 | 2,640 | 18 | 3.1 | 215 | **37** |
-| 1,000 | 21.6 | 999 | 21,579 | 15 | 31.1 | 78 | **27** |
+| n | b | distinct keys | m | k | predicted | v1 | v2 | v3 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 26.4 | 100 | 2,640 | 18 | 3.1 | 215 | 37 | **23** |
+| 1,000 | 21.6 | 999 | 21,579 | 15 | 31.1 | 78 | 27 | **36** |
 
-And the standard false-positive experiment (`queries/fp_rate.sql`, 10,000 keys, large m) with the new code still matches the formula:
+And the standard false-positive experiment (`queries/fp_rate.sql`, 10,000 keys, large m) with version 3 still matches the formula:
 
-| b | m | k | measured | predicted |
+| b | m | k | measured (v3) | predicted |
 |---:|---:|---:|---:|---:|
-| 4 | 40,000 | 3 | 0.144824 | 0.146892 |
-| 8 | 80,000 | 6 | 0.021121 | 0.021577 |
-| 12 | 120,000 | 8 | 0.003147 | 0.003142 |
-| 16 | 160,000 | 11 | 0.000453 | 0.000459 |
-| 22 | 220,000 | 15 | 0.000023 | 0.000026 |
+| 4 | 40,000 | 3 | 0.145933 | 0.146892 |
+| 8 | 80,000 | 6 | 0.021308 | 0.021577 |
+| 12 | 120,000 | 8 | 0.003179 | 0.003142 |
+| 16 | 160,000 | 11 | 0.000445 | 0.000459 |
+| 22 | 220,000 | 15 | 0.000020 | 0.000026 |
 
-How to read the counts: false positives are random, so a count c varies by about ±2·√c between experiments (for example 29 ± 11, or 355 ± 38). Within that noise, v2 matches the formula at n = 1,000 and n = 10,000. The large-m differences between v1 and v2 (342 vs 355, 7,906 vs 8,140) are noise.
+How to read the counts: false positives are random, so a count c varies by about ±2·√c between experiments (for example 14 ± 7, 31 ± 11, or 8,194 ± 181). Within that noise, v2 and v3 match the formula at n = 1,000 and n = 10,000. The differences between versions at large m (for example 7,906 / 8,140 / 8,363) are noise. Only the n = 100 row is clearly above the formula.
 
-**Summary:** enhanced double hashing removes most of the excess. At n = 100 it goes from about 55× the prediction down to about 9× (from 69× to 12× with the real keys). At n = 1,000 it removes the excess completely.
+**Summary:** at n = 100, the excess over the prediction goes from about 55× (v1) to 9× (v2) to **4.5×** (v3). With the real keys it goes from 69× to 12× to 7×. At n = 1,000 and above, v2 and v3 match the formula.
 
 ## 4. Remaining gap at small m: a known limitation
 
-At n = 100 (m = 2,640) we still measure about 29 false positives where the formula says 3. The cause is that **both** versions compute all k positions from just two numbers, h1 mod m and h2 mod m:
+At n = 100 (m = 2,640) we still measure 14 false positives where the formula says 3. The cause is that every version computes all k positions from just two numbers, h1 mod m and h2 mod m:
 
-- There are only about m² such pairs. Since h2 is forced odd and our m is even here, h2 mod m is always odd, so there are only m²/2 = 3.5 million pairs.
+- There are only m² such pairs: 2,640² ≈ 7.0 million.
 - A non-member whose pair equals a member's pair gets **exactly the same k positions**, so it is **always** a false positive. Making k bigger does not help.
-- Expected number of such keys: 1,000,000 × n / (m²/2) = 1,000,000 × 100 / 3,484,800 ≈ **29**.
+- Expected number of such keys: 1,000,000 × n / m² = 1,000,000 × 100 / 6,969,600 ≈ **14**.
+- In version 2, h2 was forced odd. With an even m, h2 mod m could then only be odd, so only m²/2 pairs were possible and this number doubled to ≈ 29. That is exactly why version 3 stopped forcing the step odd.
 
 We counted these keys directly from `hashint4extended` (Step 3 of `queries/fp_cases.sql`):
 
-| n | m | non-members with exactly a member's positions | expected |
-|---:|---:|---:|---:|
-| 100 | 2,640 | 25 | 28.7 |
-| 1,000 | 21,600 | 3 | 4.3 |
+| n | m | non-members with exactly a member's positions, v2 (odd step) | expected v2 (m²/2 pairs) | v3 | expected v3 (m² pairs) |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 2,640 | 25 | 28.7 | **13** | 14.3 |
+| 1,000 | 21,600 | 3 | 4.3 | **2** | 2.1 |
 
-So at n = 100, 25 of the 29 false positives come from this effect, and the rest is the ~3 the formula predicts. This floor shrinks like n/m², which is why it disappears for larger filters.
+So at n = 100, 13 of the 14 false positives in version 3 come from this effect, and the formula's ~3 is within the noise of the rest. This floor shrinks like n/m², which is why it disappears for larger filters.
 
 This is a known property of double hashing. Kirsch & Mitzenmacher (2006) prove that a Bloom filter that derives its k positions from two hash values reaches the standard false-positive rate only **asymptotically**, as the filter grows. For small m some extra false positives remain.
 
 **Decision.** Our false-positive model stays ONLY the standard formula. We document the small-m gap as a limitation and do not model it, because:
 
 - it only matters when the formula predicts very few false positives (tiny filters with a large b);
-- even then the cost is small: at n = 100, about 26 extra rows ≈ 440 bytes of narrow-row text. A wrong b would cost far more;
+- even then the cost is small: at n = 100, about 11 to 20 extra rows ≈ 190 to 340 bytes of narrow-row text. A wrong b would cost far more;
 - the final join result is always exactly correct, whatever the false-positive rate.
 
-Possible future improvements (**not done**, both would change a fixed design decision):
-
-- not forcing h2 to be odd, which would halve the floor when m is even (we counted 13 instead of 25 at n = 100);
-- taking more hash bits per key, for example a second `hashint4extended` call with another seed.
+Possible future improvement (**not done**; it would change the fixed design decision of one hash call per key): take more hash bits per key, for example a second `hashint4extended` call with another seed, so the positions depend on more than m² pairs.
 
 ## 5. Effect on the benchmark
 
@@ -142,12 +150,12 @@ We reran the full Batch 4 benchmark (`bench/run_all.sh`) with enhanced double ha
 
 At n = 100 the Bloom query now moves half the bytes. At n = 1,000 `bloom_dynamic` (22,660 bytes) now beats the exact key list (23,648 bytes). For large n nothing changes, as expected. The b sweep (n = 10,000) still has its minimum next to the predicted b*: narrow b = 18 (b* = 16.8; b = 16 and b = 18 differ by only 0.2%), wide b = 20 (b* = 20.45). The old charts are kept in `docs/midsem/v1/`, and the new ones are in `docs/midsem/`.
 
-## 6. Compatibility: filter version 2
+## 6. Compatibility: the filter version
 
-Site A builds the filter and site B tests keys against it, so both **must** compute the same positions. A filter built by the old code but read with the new positions could silently drop matching rows (false negatives), and the join result would be wrong. So the filter header's version went from 1 to 2 (`SJB_VERSION` in `sjbloom/sjb_filter.h`). A filter with any other version is refused:
+Site A builds the filter and site B tests keys against it, so both **must** compute the same positions. A filter built by older code but read with the new positions could silently drop matching rows (false negatives), and the join result would be wrong. So the filter header's version went up with every change of the position rule: 1 → 2 → 3 (`SJB_VERSION` in `sjbloom/sjb_filter.h`). A filter with any other version is refused:
 
 ```
-ERROR:  sjbloom: filter has version 1, but this sjbloom understands only version 2
+ERROR:  sjbloom: filter has version 2, but this sjbloom understands only version 3
 HINT:  Site A and site B must run the same sjbloom build. Install it on both sites and rebuild the filter.
 ```
 
@@ -162,7 +170,7 @@ psql -X -d site_a -f queries/fp_rate.sql     # standard experiment, large m
 psql -X -d site_a -f queries/fp_cases.sql    # the small-m cases, real keys, and the pair count
 ```
 
-The version 1 numbers come from the branch `fp-investigation` (commit `cc29986`, file `queries/fp_v1_v2.sql`). That branch had both versions side by side; master has only version 2.
+The version 1 numbers come from the branch `fp-investigation` (commit `cc29986`, file `queries/fp_v1_v2.sql`), which had versions 1 and 2 side by side. The version 2 numbers can be reproduced on master at commit `8fe846c` (the last version-2 commit). Master now has only version 3.
 
 ## References
 

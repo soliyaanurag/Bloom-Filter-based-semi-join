@@ -17,3 +17,8 @@ REGRESS = sjbloom_basic
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Both .c files include sjb_filter.h, but PGXS does not know that. Without
+# this line, changing the header (for example SJB_VERSION) would NOT
+# recompile sjbloom.o, and the old value would silently stay in sjbloom.so.
+$(OBJS): sjb_filter.h

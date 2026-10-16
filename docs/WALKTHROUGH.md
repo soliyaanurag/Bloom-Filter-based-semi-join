@@ -580,3 +580,27 @@ psql -X -d site_a -f queries/fp_cases.sql
 # An old (version 1) filter must be refused:
 psql -d site_a -c "SELECT sjb_contains(set_byte(sjb_build(ARRAY[1,2,3], 64, 3), 0, 1), 2);"
 ```
+
+### Follow-up: early exit, and the step no longer forced odd
+
+**Early exit (`sjbloom/bloom.c`).** `sjb_bloom_test` now computes the positions one at a time and tests each bit immediately, returning false at the first 0 bit. The positions are exactly the same as before, so the results are too: `fp_rate.sql` and `fp_cases.sql` gave identical output before and after. A new helper, `step_to_next_position`, holds the update rule (`x = x + y`, then `y = y + i`, mod m), and both `compute_positions` (used by add) and the test use it, so add and test can never disagree. Why it matters: site B runs the test on every one of its 1,000,000 rows, and most keys are rejected after 1 or 2 positions. The old code computed all k positions first.
+
+**New script `bench/time_contains.py`.** It runs `SELECT count(*) FROM customers WHERE sjb_contains(filter, customer_id)` in site_b 5 times per filter and prints the median time. Before / after the early exit:
+
+| filter | k | rows passed | median before | median after |
+|---|---:|---:|---:|---:|
+| n = 100, b = 26.4 | 18 | 129 | 102.7 ms | 69.2 ms |
+| n = 10,000, b = 16.8 | 12 | 10,348 | 89.7 ms | 74.7 ms |
+
+**Step not forced odd (`sjbloom/bloom.c`, `sjb_filter.h`).** `compute_two_hashes` no longer forces h2 odd (`| 1` removed), like PostgreSQL's `bloomfilter.c`. Enhanced double hashing does not need an odd step, and forcing it halved the number of usable (h1 mod m, h2 mod m) pairs when m is even, which doubled the extra false positives of small filters. The bit positions changed, so `SJB_VERSION` is now **3**. Results are in [docs/fp_investigation.md](fp_investigation.md).
+
+**`sjbloom/Makefile`.** It has a new line, `$(OBJS): sjb_filter.h`. PGXS does not know that our .c files include the header, so after changing `SJB_VERSION`, `make` recompiled only `bloom.c` and `sjbloom.so` kept version 2 (we noticed because a version-2 filter was accepted). With this line, a header change recompiles both files.
+
+How to test (after `make -C sjbloom install` and recreating the extension in both sites):
+
+```bash
+psql -d site_a -c "SELECT get_byte(sjb_build(ARRAY[1], 64, 1), 0);"   # 3
+psql -d site_a -c "SELECT sjb_contains(set_byte(sjb_build(ARRAY[1,2,3], 64, 3), 0, 2), 2);"   # ERROR: version 2
+psql -X -d site_a -f queries/fp_cases.sql
+.venv/bin/python bench/time_contains.py
+```
