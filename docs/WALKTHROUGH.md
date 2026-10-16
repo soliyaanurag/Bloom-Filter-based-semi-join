@@ -604,3 +604,192 @@ psql -d site_a -c "SELECT sjb_contains(set_byte(sjb_build(ARRAY[1,2,3], 64, 3), 
 psql -X -d site_a -f queries/fp_cases.sql
 .venv/bin/python bench/time_contains.py
 ```
+
+## Batch 5: calibration, a time-based cost model, and adaptive filter modes
+
+Up to now the filter was always a Bloom filter whose size we chose by hand (or with `sjb_best_bits` in Python). In this batch the extension decides by itself, using **estimated time**:
+
+```
+time = bytes moved / bandwidth  +  work at site B
+```
+
+This is communication cost plus local processing cost, as in Özsu & Valduriez, *Principles of Distributed Database Systems*. There are two decisions.
+
+**Which PATH (decided at plan time in Batch 6; this batch only builds and tests the function):**
+
+| path | what site B gets | work at B | rows back |
+|---|---|---|---|
+| index | `customer_id = ANY(key list)` | n index lookups: `n * t_lookup_us` | M |
+| filter | `sjb_contains(filter, customer_id)` | checks ALL rows: `s_rows * t_check_ns` | depends on the mode |
+
+**Which MODE inside the filter path (decided at runtime by `sjb_build_auto`, when the exact number of distinct keys is known):**
+
+| mode | filter on the wire (hex text) | rows back |
+|---|---|---|
+| BLOOM | `2 * (24 + ceil(m/8)) + 2` | M + (s_rows − M) · fp |
+| EXACT (sorted key list) | `2 * (24 + 4n) + 2` | M |
+| PASS (header only) | `2 * 24 + 2` | s_rows |
+
+Here M = min(s_rows, n · rows_per_key) is the number of rows that really match, and fp = (1 − e^(−kn/m))^k (Broder & Mitzenmacher 2004). The index path's key list costs `n * 7 + 2` bytes (about 6 digits and a comma per key, plus the braces). Rows back cost `row_width` bytes each. **row_width is the width on the wire**: the text of the values + 7 bytes per row + 4 bytes per column (PostgreSQL's DataRow message). Bandwidth in bytes per second is `network_mbit * 125000`.
+
+The Bloom size comes from **b\***, the bits per key that minimise the total bytes (same formula as Batch 3's `sjb_best_bits`). With the best k, fp(b) = e^(−0.4805·b), where 0.4805 = (ln 2)². The total bytes are
+
+```
+total(b) = W·n·b/8  +  M·w  +  (S − M)·w·e^(−0.4805·b)       (W = wire factor 2, w = row width, S = s_rows)
+```
+
+Setting the derivative to 0 gives `b* = ln(3.844 · (S − M) · w / (W · n)) / 0.4805` (3.844 = 8 · 0.4805). If the value inside ln() is ≤ 1, Bloom is not worth it and b* = 0. Then m = max(8, ceil(n · b*)) and k = round(0.693 · b*), between 1 and 32.
+
+### Files
+
+**`sjbloom/costmodel.h`, `sjbloom/costmodel.c`** (new): the cost model as plain arithmetic on doubles, with no SQL values. One small function per formula, each with a comment naming its source: `sjb_fp_rate`, `sjb_best_bits`, `sjb_bloom_bits_for` (m), `sjb_bloom_hashes_for` (k), `sjb_matching_rows` (M), `sjb_bloom_filter_bytes`, `sjb_exact_filter_bytes`, `sjb_pass_filter_bytes`, `sjb_key_list_bytes`, `sjb_bandwidth_bytes_per_sec`. All the inputs travel in one struct, `SjbCostInputs`. **`sjb_estimate_all`** fills in four `SjbCostEstimate`s (index, bloom, exact, pass), each with its bytes, rows back, network time, work at B and total, and then makes both decisions:
+- `best_filter_mode`: the allowed mode with the smallest time. BLOOM is skipped when b\* = 0 or its filter is bigger than `max_filter_bytes`; EXACT is skipped when it is bigger than `max_filter_bytes`. PASS is never skipped (24 bytes), so there is always a mode. On a tie the simpler mode wins: PASS, then EXACT, then BLOOM.
+- `index_path_wins`: index path time ≤ the best filter mode's time.
+
+`max_filter_bytes` limits the filter value itself (header included), not its hex text.
+
+**`sjbloom/sjbloom.c`**: the file is now in five parts: checking a filter, the EXACT payload, building filters, reading cost model arguments, and the SQL functions.
+- `sjb_build_auto(keys, s_rows, rows_per_key, row_width, network_mbit, t_check_ns, max_filter_bytes DEFAULT 1048576, wire_factor DEFAULT 2)`: `collect_unique_keys` copies the non-NULL keys into a C array, sorts it with `qsort` + `compare_int32`, and removes repeats (`remove_duplicates`) to get n. With n = 0 it returns an EXACT filter with no keys: nothing passes, and an empty R' gives an empty join, so that is correct. Otherwise it calls `sjb_estimate_all` and builds the winner with `build_bloom_filter`, `build_exact_filter` (keys copied one by one with memcpy) or `build_pass_filter`. The header's nkeys is n in every mode.
+- `sjb_contains` now branches on the mode: BLOOM as before, EXACT = `exact_filter_contains`, a hand-written binary search that reads each key with memcpy (`read_exact_key`; the bytes inside a bytea may be unaligned), PASS = true. Each mode first checks that its payload has the right size (`check_exact_filter`, `check_pass_filter`).
+- `sjb_info` prints mode-specific details, e.g. `mode=exact nkeys=3 min_key=1 max_key=3 bytes=36` or `mode=pass nkeys=5000 bytes=24`.
+- `sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit, t_check_ns, t_lookup_us)` returns a readable table: one line for the index path and one per filter mode, then the Bloom size, the best filter mode and the winner. `sjb_plan_choice(same arguments)` returns just `'index'` or `'filter'`; Batch 6's planner hook will call it. Both read their arguments with the same helper (`read_report_arguments`) and use the default max_filter_bytes and wire_factor, so they always agree with `sjb_build_auto`.
+- `sjb_build` now uses the same `new_filter` / `write_header` / `build_bloom_filter` helpers; its output is unchanged.
+- All settings are **arguments**, never read from configuration settings (GUCs). So the functions really are IMMUTABLE (same inputs, same output), which postgres_fdw needs before it ships `sjb_contains` to site B.
+
+New PostgreSQL helpers used: `PG_GETARG_FLOAT8` (read a float8 argument), `StringInfo` / `initStringInfo` / `appendStringInfo` (a growing text buffer for the report), `palloc` (PostgreSQL's malloc).
+
+`SJB_VERSION` stays 3: BLOOM filters are unchanged, and an older build rejects modes 2 and 3 with a clear error instead of misreading them.
+
+**`sjbloom/sjbloom--1.0.sql`**: the three new functions, all `IMMUTABLE STRICT PARALLEL SAFE`. **`sjbloom/Makefile`**: `costmodel.o` added to OBJS, and `$(OBJS): sjb_filter.h costmodel.h`, so changing either header rebuilds everything.
+
+**`sjbloom/sql/sjbloom_basic.sql`**: Steps 9–18. Zero keys (or only NULLs) give `mode=exact nkeys=0` and nothing passes. Repeats and NULLs are removed. For keys 1..5000 each mode wins in the right case:
+
+| s_rows | mode | why |
+|---|---|---|
+| 1,000,000 | BLOOM | b* ≈ 19.5 bits per key, smaller than EXACT's 32 |
+| 10^12 | EXACT | false positives so costly that b* ≈ 48 > 32 |
+| 5,000 (= n) | PASS | every row matches anyway |
+| 10^12, max_filter_bytes = 10000 | PASS | EXACT and BLOOM are both too big |
+
+There are no false negatives in any mode, and no false positives for EXACT (1 million non-member keys tested). The binary search handles −2147483648, 2147483647 and negative keys. One full `sjb_choice_report` is printed. `sjb_plan_choice` says index on a fast network and filter on a slow one with many keys. Invalid arguments and an unknown mode give errors.
+
+**`bench/calibrate.py`** (new): measures the two machine constants directly in site_b. See "Calibration" below.
+
+**`bench/validate_model.py`** (new): predicted vs measured time. See "Does the model predict real times?" below.
+
+**`queries/catalog_stats.sql`** (new): reads `s_rows` (`pg_class.reltuples`), `rows_per_key` (reltuples / distinct values; `pg_stats.n_distinct` < 0 means a fraction of the rows, −1 = all distinct) and `row_width` (sum of `pg_stats.avg_width` for customer_id and name, + 7 + 4·2) from **site_a's** catalog into psql variables with `\gset`. On our data: 1,000,000, 1, 30. (avg_width is the stored width: 4 bytes for an int4 whose text has 6–7 digits, so 30 is a bit below the measured 31.78.)
+
+**`queries/auto_manual.sql`** + **`queries/auto_manual_one.sql`** (new): the real join with `sjb_contains((SELECT sjb_build_auto(array_agg(customer_id), ...) FROM orders WHERE order_id <= :n), c.customer_id)`. It shows the plan for n = 10000, then sjb_info and both EXCEPT ALL counts for n = 100, 10000 and 150000. No `DISTINCT` is needed in `array_agg`, because `sjb_build_auto` removes repeats itself.
+
+**`queries/choice_demo.sql`** (new): the presentation demo, `sjb_choice_report` for n = 10000 and 50000 at 1000 and 1 Mbit/s.
+
+### Calibration (`bench/calibrate.py`)
+
+- **t_check_ns**: build a Bloom filter of 10,000 random existing keys (b = 16, k = 11). Run `EXPLAIN (ANALYZE, FORMAT JSON) SELECT customer_id, name FROM customers WHERE sjb_contains(filter, customer_id)` 5 times (after one untimed warm-up run). Median execution time / 1,000,000 rows. The same is done with an EXACT and a PASS filter of the same keys.
+- **t_lookup_us**: for n = 1000, 5000, 10000, 20000 random existing keys, the median of 5 runs of `... WHERE customer_id = ANY(keys)`. Then a straight line `time = a + n · slope` is fitted by least squares (the formula is written out in `fit_line`). t_lookup_us = the slope.
+- **Parallel workers off.** postgres_fdw runs the remote query through a cursor, and PostgreSQL never uses parallel workers for a cursor. So every measurement uses `SET max_parallel_workers_per_gather = 0`. For comparison, everything is measured a second time with the default (2), and both are saved in `results/calibration.json`.
+
+Our results (`results/calibration.json`):
+
+```
+mode  | ms_no_parallel | t_check_ns | ms_parallel | plan with parallel allowed
+bloom |         182.62 |     182.62 |      177.29 | Seq Scan
+exact |         153.62 |     153.62 |      153.26 | Seq Scan
+pass  |         205.69 |     205.69 |      205.42 | Seq Scan
+reference, SELECT count(*) with the Bloom filter: 141.03 ms (Index Only Scan) vs
+           54.85 ms (Gather, Index Only Scan, 2 workers), speedup 2.57
+
+    n | ms_no_parallel | ms_parallel | plan
+ 1000 |           3.64 |        2.72 | Index Scan
+ 5000 |          14.19 |       13.63 | Index Scan
+10000 |          23.51 |       22.89 | Index Scan
+20000 |          36.05 |       34.56 | Index Scan
+fitted line (no parallel): time_ms = 4.456 + n * 0.001655  ->  t_lookup_us = 1.6547
+
+Suggested: t_check_ns = 182.62, t_lookup_us = 1.6547
+```
+
+What we learned:
+- **With and without parallel workers the times are the same, because the planner never chose a parallel plan for these queries.** For `WHERE sjb_contains(...)` it guesses that 1/3 of the rows pass (333,333 rows). Sending that many rows through a Gather node costs more than the workers would save. The 2x speed-up only shows up for `SELECT count(*)`, where each worker counts its part and sends back one number: 141 → 55 ms. That is also why Batch 4's `time_contains.py` (which uses `count(*)`) reported about 75 ms. Through postgres_fdw site B really needs about 180 ms.
+- **One constant is roughly enough.** EXACT (154 ns) is cheaper than BLOOM (183 ns): a binary search over 10,000 keys is about 14 comparisons, while BLOOM computes a hash. PASS (206 ns) is the most expensive, because all 1,000,000 rows leave the scan node. The spread is about ±15% around the BLOOM value, which is the one we use. Inside the filter path all modes use the same t_check_ns, so the mode choice depends only on bytes.
+- **The lookup line is not quite straight.** The cost per extra key falls from about 2.6 µs (1000 → 5000) to 1.25 µs (10000 → 20000), because neighbouring keys share index pages. The fitted line has a 4.5 ms intercept, which the model (n · t_lookup_us) leaves out.
+- **WSL timing is noisy.** Three runs gave t_check_ns = 150, 188 and 183 ns. Rerun `calibrate.py` on your own machine and pass your values with `-v t_check_ns=... -v t_lookup_us=...`.
+- A side discovery: when the filter is stored in a table (for example a temp table) and read back with `(SELECT filter FROM t)`, the 20 KB value is TOASTed. `sjb_contains` then fetches it again for every row: 5.5 s instead of 0.18 s. Through postgres_fdw this does not happen, because the filter arrives as a query parameter, but test queries should build the filter inline or in a CTE, not store it in a table.
+
+### Results: which mode `sjb_build_auto` chose (`auto_manual.sql`)
+
+```
+     n | filter_info                                                         | missing | extra
+   100 | mode=bloom nkeys=100 m=2761 k=19 bits_set=49.58% bytes=370          |       0 |     0
+ 10000 | mode=bloom nkeys=9955 m=179299 k=12 bits_set=48.70% bytes=22437     |       0 |     0
+150000 | mode=bloom nkeys=139294 m=1703339 k=8 bits_set=48.03% bytes=212942  |       0 |     0
+```
+
+The plan shows `Remote SQL: SELECT customer_id, name FROM public.customers WHERE (public.sjb_contains($1::bytea, customer_id))`, with sjb_build_auto in an InitPlan.
+
+Why BLOOM every time (numbers from `sjb_choice_report` with the same inputs, at 1000 Mbit/s): in the filter path site B checks all 1,000,000 rows in every mode (182.6 ms), so only the bytes differ.
+- **n = 100**: BLOOM's filter is 742 bytes on the wire (27.6 bits per key) and lets about 2 extra rows through. EXACT's is 850 bytes. BLOOM wins by about 100 bytes (0.001 ms), so this is practically a tie. PASS would send all 1,000,000 rows back (30 MB, 240 ms).
+- **n = 10000**: BLOOM 44.9 KB + 174 false-positive rows (5 KB), EXACT 79.7 KB. BLOOM wins by about 30 KB (0.24 ms).
+- **n = 150000**: BLOOM 426 KB (12.2 bits per key) + 2,432 false positives (73 KB), EXACT 1.11 MB. BLOOM wins by about 600 KB (4.9 ms).
+
+EXACT would win only if Bloom needed more than about 32 bits per key, for example with a much bigger S or much wider rows (test Step 11, s_rows = 10^12). PASS would win only if almost every customer matched (n close to s_rows). In our data, b* is between 12 and 28, so Bloom is always smaller. The index path would be much faster at n = 100 and 10000 (0.2 and 19 ms instead of about 183 ms), but `auto_manual.sql` always uses the filter path; choosing the path is Batch 6's job.
+
+### Results: the demo (`choice_demo.sql`)
+
+| n | network | index path | best filter (bloom) | winner |
+|---|---|---:|---:|---|
+| 10000 | 1000 Mbit/s | 19.5 ms | 185.4 ms | index |
+| 10000 | 1 Mbit/s | 2,976.6 ms | 2,984.9 ms | index (by 8 ms) |
+| 50000 | 1000 Mbit/s | 97.5 ms | 196.3 ms | index |
+| 50000 | 1 Mbit/s | 14,882.8 ms | 13,847.9 ms | **filter** |
+
+- On the fast network the bytes take only a few ms, so the work at site B decides. 10,000 or 50,000 index lookups (16.5 or 82.7 ms) are cheaper than checking 1,000,000 rows (182.6 ms).
+- On the slow network every byte costs 8 µs, so the bytes decide. The rows that come back are about the same for both paths (M rows of 30 bytes). The difference is what A sends: the key list takes about 7 bytes per key, while the Bloom filter takes about 2·b/8 bytes per key as hex (4.5 bytes at b = 18, 3.6 bytes at b = 14.6). At n = 10000 that saves 25 KB = 0.2 s, almost exactly the extra 166 ms of site B's full scan, so the two paths nearly tie. At n = 50000 it saves 168 KB = 1.3 s, much more than the extra 100 ms of the full scan, so the filter path wins.
+
+### Does the model predict real times? (`bench/validate_model.py`)
+
+Narrow rows, network_mbit = 1000, the calibrated constants, and the wire row width 16.78 + 7 + 8 = 31.78. "measured" is the end-to-end time at site A (planning + execution, median of 3). "fscan" is the time of the Foreign Scan node alone (waiting for B, receiving and converting the rows). Ratio = measured / predicted.
+
+```
+     n | strategy                  | pred_network | pred_work_B | predicted | measured | ratio | fscan_ms | fscan_ratio | pred_rows | remote_rows
+   100 | exact_keys (nestloop off) |         0.03 |        0.17 |      0.20 |     1.50 |  7.61 |     1.00 |        5.09 |       100 |         100
+   100 | bloom_dynamic (b=27.73)   |         0.03 |      182.62 |    182.65 |   178.92 |  0.98 |   178.26 |        0.98 |       102 |         109
+  1000 | exact_keys (nestloop off) |         0.31 |        1.65 |      1.96 |     6.97 |  3.55 |     5.88 |        3.00 |       999 |         999
+  1000 | bloom_dynamic (b=22.93)   |         0.30 |      182.62 |    182.92 |   188.53 |  1.03 |   187.07 |        1.02 |     1,015 |       1,016
+ 10000 | exact_keys (nestloop off) |         3.09 |       16.47 |     19.56 |    58.16 |  2.97 |    49.69 |        2.54 |     9,955 |       9,955
+ 10000 | bloom_dynamic (b=18.13)   |         2.93 |      182.62 |    185.55 |   227.73 |  1.23 |   218.18 |        1.18 |    10,119 |      10,108
+ 50000 | exact_keys (nestloop off) |        15.12 |       80.65 |     95.77 |   293.52 |  3.06 |   259.07 |        2.71 |    48,738 |      48,738
+ 50000 | bloom_dynamic (b=14.74)   |        14.03 |      182.62 |    196.65 |   324.98 |  1.65 |   278.51 |        1.42 |    49,537 |      49,480
+```
+
+What it shows:
+- **The row counts are right.** Predicted rows back match the real remote rows almost exactly (the false-positive formula and M are correct).
+- **The filter path is right when few rows come back** (ratio 0.98 and 1.03 at n = 100 and 1000): then the full scan at B is nearly all the time, and t_check_ns measures exactly that.
+- **The error grows with the number of returned rows.** For bloom_dynamic, the extra time over the prediction is about 42 ms for 10,000 rows and 128 ms for 49,500 rows. For exact_keys it is about 39 ms for 9,955 rows and 198 ms for 48,738 rows. That is roughly **3–4 µs per returned row** end to end; about 1.7–3.4 µs of it is already inside the Foreign Scan. The model has no term for this.
+- **The index path's ratio is about 3 for every n ≥ 1000.** Its predicted time is small, so the same missing per-row cost is a big fraction of it. Per returned row, the extra is about the same for both strategies at n = 10000 (about 4 µs), but at n = 50000 it is bigger for exact_keys (4.1 µs) than for Bloom (2.6 µs). That hints at extra per-KEY work on the index path: turning the key list into text at A, parsing it at B (`array_in`), B planning a query with a 48,000-element array, and sorting the array keys before the index scan. The calibration timed only the index scan itself, with the array already parsed and the plan already made. For exact_keys, keys and returned rows are the same number, so these two costs cannot be told apart from these runs. Also, the Bloom full scan alone varies by ±20 ms between runs, so per-row figures from n = 10000 are rough.
+
+What is missing from the model (reported, NOT added, as agreed):
+1. **A cost per returned row**: B turns each row into text, postgres_fdw fetches 100 rows per round trip (`fetch_size`), and A parses the text back into values. About 2–4 µs per row here. With 1000 Mbit/s the model's network term is only about 0.3 µs per row, so the real per-row cost is CPU, not the wire. (On localhost the real "network" is much faster than 1000 Mbit/s.)
+2. **Probably, extra per-key work on the index path** beyond the index lookup (key list text, array parsing and planning at B): at n = 50000 about 1.5 µs per key more than the filter path pays per row; at n = 10000 not visible within the noise.
+3. **Work at site A**: scanning orders, the `DISTINCT` sorts that build the key list or filter, and the hash join (measured − fscan: 34 ms for exact_keys and 47 ms for Bloom at n = 50000).
+4. **A fixed cost per query** of about 1 ms (planning, opening and closing the remote cursor, round trips). It only matters for tiny n (ratio 7.6 at n = 100, but only 1.3 ms in absolute terms).
+
+Does it change decisions? On the fast network, the model puts the break-even between the index path and the Bloom filter path near 110,000 keys (182.6 ms / about 1.7 µs per key). In the measurements, exact_keys costs about 6 µs per key at both n = 10000 and 50000, and Bloom costs about 183 ms + 2.9 µs per row at n = 50000. Straight lines through these points cross near 60,000 keys. With only these few noisy points that is a rough guess, but it suggests the model is biased towards the index path for large n: between roughly 60,000 and 110,000 keys it could pick the index path when the filter path is really faster. Items 1 and 2 are what we would add. Both can be calibrated the same way: time a query that returns R rows through postgres_fdw, and the same query directly at B. That is for us to decide before Batch 6.
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom && make -C sjbloom install
+# recreate the extension in both sites (it stays version 1.0, no upgrade script):
+for db in site_a site_b; do psql -d $db -c "DROP EXTENSION sjbloom CASCADE" -c "CREATE EXTENSION sjbloom"; done
+make -C sjbloom installcheck                         # 1 test, ok
+psql -d site_a -c "SELECT get_byte(sjb_build(ARRAY[1], 64, 1), 0);"   # 3
+
+.venv/bin/python bench/calibrate.py                  # writes results/calibration.json (about 10 s)
+psql -X -d site_a -f queries/auto_manual.sql         # modes + correctness (all counts 0)
+psql -X -d site_a -f queries/choice_demo.sql         # the four reports
+.venv/bin/python bench/validate_model.py             # predicted vs measured (about 5 s)
+```
+
+To use your own calibrated values in the SQL files: `psql -X -d site_a -v t_check_ns=150 -v t_lookup_us=1.5 -f queries/choice_demo.sql`. `DROP EXTENSION ... CASCADE` does not remove the `extensions 'sjbloom'` option of the foreign server; that is only text, so `enable_sjbloom.sql` does not need to be run again.

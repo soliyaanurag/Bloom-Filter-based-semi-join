@@ -32,7 +32,8 @@ RETURNS bool
 AS 'MODULE_PATHNAME', 'sjb_contains'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
--- Step 3: sjb_info. A debugging helper: describes a filter in one line.
+-- Step 3: sjb_info. A debugging helper: describes a filter (any mode) in
+-- one line.
 CREATE FUNCTION sjb_info(filter bytea)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_info'
@@ -91,3 +92,73 @@ AS $$
         ELSE ln(8 * 0.4805 * (s_rows - matches) * row_width / (n * wire_factor)) / 0.4805
     END
 $$;
+
+/*
+ * Step 5: sjb_build_auto (Batch 5). Runs at site A: the cost model picks
+ * the filter mode (BLOOM, EXACT or PASS) and the Bloom size at RUNTIME,
+ * when the exact number of distinct keys is known, then builds it.
+ *
+ * Inputs:
+ *   keys             site A's join keys (NULLs and repeats are fine)
+ *   s_rows           rows of S (customers) at site B
+ *   rows_per_key     rows of S per key value (1 for a unique column)
+ *   row_width        bytes of one returned row ON THE WIRE
+ *                    (text width + 7 + 4 * number of columns)
+ *   network_mbit     network speed in megabits per second
+ *   t_check_ns       site B's time to scan + check one row (calibrated)
+ *   max_filter_bytes BLOOM or EXACT filters bigger than this are not built
+ *   wire_factor      wire bytes per filter byte (2: hex text)
+ *
+ * All settings are ARGUMENTS, never read from configuration settings, so
+ * the function really is IMMUTABLE: the same inputs always give the same
+ * filter. The formulas are in costmodel.c.
+ */
+CREATE FUNCTION sjb_build_auto(keys int4[],
+                               s_rows float8,
+                               rows_per_key float8,
+                               row_width float8,
+                               network_mbit float8,
+                               t_check_ns float8,
+                               max_filter_bytes int8 DEFAULT 1048576,
+                               wire_factor float8 DEFAULT 2)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'sjb_build_auto'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+/*
+ * Step 6: sjb_choice_report (Batch 5). A readable multi-line report of the
+ * cost model: for the INDEX path ("customer_id = ANY(key list)", n index
+ * lookups at B) and for each filter mode ("sjb_contains", |S| checks at B)
+ * it shows bytes A->B, rows back, bytes B->A, network time, work at B and
+ * total time, then the winner. It runs the same C code as sjb_build_auto.
+ *
+ * n is the number of distinct keys. t_lookup_us is site B's time for one
+ * index lookup (calibrated). max_filter_bytes and wire_factor are the
+ * defaults of sjb_build_auto (1 MB and 2).
+ */
+CREATE FUNCTION sjb_choice_report(n float8,
+                                  s_rows float8,
+                                  rows_per_key float8,
+                                  row_width float8,
+                                  network_mbit float8,
+                                  t_check_ns float8,
+                                  t_lookup_us float8)
+RETURNS text
+AS 'MODULE_PATHNAME', 'sjb_choice_report'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+/*
+ * Step 7: sjb_plan_choice (Batch 5). The same estimates as
+ * sjb_choice_report, but only the decision: 'index' or 'filter'. Batch 6's
+ * planner hook will call it, so the decision lives in one place.
+ */
+CREATE FUNCTION sjb_plan_choice(n float8,
+                                s_rows float8,
+                                rows_per_key float8,
+                                row_width float8,
+                                network_mbit float8,
+                                t_check_ns float8,
+                                t_lookup_us float8)
+RETURNS text
+AS 'MODULE_PATHNAME', 'sjb_plan_choice'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

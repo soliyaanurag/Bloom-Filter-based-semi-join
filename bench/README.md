@@ -12,6 +12,8 @@
 | `plot.py` | draws the PNG charts in `results/` |
 | `run_all.sh` | runs the three scripts above in order |
 | `time_contains.py` | times site B's full scan with `sjb_contains` (median of 5), to compare two builds of the C code |
+| `calibrate.py` | Batch 5: measures site B's `t_check_ns` and `t_lookup_us` (parallel workers off, and once on for comparison), writes `results/calibration.json` |
+| `validate_model.py` | Batch 5: predicted time (`sjb_choice_report`) vs measured time for exact_keys and bloom_dynamic, narrow rows |
 | `capture_bytes.sh` | prints (does not run) tcpdump/capinfos commands for a packet-capture cross-check |
 
 Rerun everything: `source setup/env.example.sh && bench/run_all.sh`. See docs/WALKTHROUGH.md, Batch 4.

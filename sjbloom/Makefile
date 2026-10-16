@@ -10,7 +10,7 @@
 #                     server and compare with expected/
 
 MODULE_big = sjbloom
-OBJS = sjbloom.o bloom.o
+OBJS = sjbloom.o bloom.o costmodel.o
 EXTENSION = sjbloom
 DATA = sjbloom--1.0.sql
 REGRESS = sjbloom_basic
@@ -18,7 +18,8 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-# Both .c files include sjb_filter.h, but PGXS does not know that. Without
-# this line, changing the header (for example SJB_VERSION) would NOT
-# recompile sjbloom.o, and the old value would silently stay in sjbloom.so.
-$(OBJS): sjb_filter.h
+# The .c files include sjb_filter.h and costmodel.h, but PGXS does not
+# know that. Without this line, changing a header (for example
+# SJB_VERSION) would NOT recompile every .o file, and the old value would
+# silently stay in sjbloom.so.
+$(OBJS): sjb_filter.h costmodel.h
