@@ -1,0 +1,8 @@
+results/
+*.o
+*.so
+*.bc
+pg-src/
+.venv/
+sjbloom/results/
+sjbloom/regression.*
