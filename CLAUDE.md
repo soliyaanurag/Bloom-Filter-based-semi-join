@@ -9,9 +9,15 @@ Site A joins a local table R (orders) with a table S (customers) that lives at s
 A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chosen per query).
 
 ## Environment
-- PostgreSQL 18 is installed from packages (not built from source). Our C extension is built with PGXS using pg_config.
+- Machine: WSL2 Ubuntu.
+- PostgreSQL 18.6 is built from source and installed at ~/postgres/postgresql/install. Its bin/ is on PATH, so `pg_config`, `psql` and `pg_ctl` come from there. Our C extension is built with PGXS using that pg_config.
+- The source tree it was built from is ~/postgres/postgresql. Do NOT build, configure or change anything in that folder.
+- `make install` writes into the user's home folder, so it needs NO sudo.
+- Data directory: ~/postgres/postgresql/install/data (exported as PGDATA). The server runs as the user, not as a system service. WSL does not start it automatically: start it with `pg_ctl -l ~/pg.log start` and check it with `pg_ctl status`.
+- Superuser roles: anuragsoliya and postgres. Port 5432.
+- pg_hba.conf uses trust for local connections, so no password is checked on this machine. Still keep the password option in the postgres_fdw user mapping, because teammates' setups may check passwords. Pass the password in as a psql variable (for example `psql -v fdw_password=...`). Never hard-code it.
 - The two "sites" are two databases, site_a and site_b, on the same local PostgreSQL server. postgres_fdw connects from site_a to site_b over localhost, so data really goes through a network connection.
-- From Batch 6 on, the PostgreSQL 18 source (same minor version as the installed one) is in ./pg-src. Only contrib/postgres_fdw is modified and rebuilt with `make USE_PGXS=1`.
+- From Batch 6 on, a separate copy of the PostgreSQL 18.6 source (the same version as the installed one) is in ./pg-src. Only contrib/postgres_fdw in ./pg-src is modified and rebuilt with `make USE_PGXS=1`. The original ~/postgres/postgresql tree is never touched.
 
 ## Fixed design decisions (do not change without asking the user)
 - Our extension is named `sjbloom`. It is installed in BOTH site_a and site_b, in schema public. It stays at version 1.0. After changing its SQL file, recreate it with DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom; (no upgrade scripts).
