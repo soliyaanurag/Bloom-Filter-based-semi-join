@@ -978,3 +978,184 @@ psql -X -d site_a -f queries/auto_manual.sql       # correctness, all counts 0
 After calibrating on another machine, pass your values to the functions (the last four arguments), or change the defaults in `sjbloom--1.0.sql` and recreate the extension.
 
 Side effect worth knowing: with the new costs, `auto_manual.sql` at n = 100 now builds **EXACT** instead of BLOOM. Bloom's ~2 false positives make 102 rows back, which needs a third FETCH round trip (0.062 ms). That costs more than the 108 bytes Bloom saves (about 1 µs at 1000 Mbit/s). At n = 10000 and 150000 it still builds BLOOM.
+
+## Batch 6: automatic two-path semijoin rewrite inside postgres_fdw
+
+Until Batch 5 the filter had to be written by hand into every query (`queries/bloom_manual.sql`, `auto_manual.sql`). In Batch 6 **postgres_fdw does it by itself**. You write the plain join:
+
+```sql
+SELECT o.order_id, c.name
+FROM orders o JOIN customers c ON c.customer_id = o.customer_id
+WHERE o.order_id <= 1000;
+```
+
+A **planner hook** inside postgres_fdw sees this query before PostgreSQL plans it, estimates how many distinct keys the local rows will have, asks sjbloom's cost model (`sjb_plan_choice`) for the cheaper path, and adds ONE condition on the foreign key to `WHERE`. The join itself is not touched. The new condition only removes customers that cannot join, so the result is always exactly the same.
+
+### Where the code is, and how a teammate gets it
+
+- The change lives in the PostgreSQL source tree `~/postgres/postgresql`, on branch **`cs631-semijoin`**. Only files under `contrib/postgres_fdw` are changed.
+- **Base commit: `a85b5523e6`** on `REL_18_STABLE`, which is REL_18_6 plus 156 commits. Since the 18.6 tag, the only change to postgres_fdw is a 2-line typo fix (`3a09e91a49`, in `postgresAcquireSampleRowsFunc`), far away from our code.
+- The whole change is exported as **`patches/postgres_fdw-semijoin.patch`**. We checked that it applies cleanly to plain 18.6 (`git apply --check` in a worktree at `REL_18_6`: no errors).
+
+How a teammate applies it to their own PostgreSQL 18 source tree, which must be the one their server was built from:
+
+```bash
+cd ~/postgres/postgresql                      # your source tree
+git switch -c cs631-semijoin                  # optional: keep it on its own branch
+git apply --check /path/to/postgre-project/patches/postgres_fdw-semijoin.patch   # dry run: no output = ok
+git apply /path/to/postgre-project/patches/postgres_fdw-semijoin.patch
+make -C contrib/postgres_fdw && make -C contrib/postgres_fdw install            # no sudo if installed in $HOME
+```
+
+Then run `setup/setup_all.sh` (it now has a step 6, see below), or, on an existing setup, run `setup/enable_semijoin.sql` once in site_a and reconnect.
+
+To get the original postgres_fdw back, do one of these:
+- `git switch REL_18_STABLE` in the source tree, then rebuild and install;
+- or copy back the backup of the original library: `cp ~/postgres_fdw.so.orig ~/postgres/postgresql/install/lib/postgres_fdw.so`. With the original library, also remove the option: `ALTER SERVER site_b_srv OPTIONS (DROP semijoin_filter)`.
+
+### Files
+
+**`contrib/postgres_fdw/option.c`** (changed):
+- Ten new settings (GUCs), all `PGC_USERSET`, so every user can `SET` them in their session:
+
+  | GUC | default | meaning |
+  |---|---|---|
+  | `postgres_fdw.enable_semijoin` | on | the whole feature on/off |
+  | `postgres_fdw.semijoin_force_path` | auto | `auto` (cost model), `index` or `filter`; for tests and demos |
+  | `postgres_fdw.semijoin_verbose` | off | a NOTICE that explains every decision |
+  | `postgres_fdw.semijoin_network_mbit` | 1000 | bandwidth between the sites |
+  | `postgres_fdw.semijoin_max_filter_kb` | 1024 (kB) | largest filter that `sjb_build_auto` may send |
+  | `postgres_fdw.semijoin_t_check_ns` | 158.19 | from results/calibration.json |
+  | `postgres_fdw.semijoin_t_lookup_us` | 4.7956 | from results/calibration.json |
+  | `postgres_fdw.semijoin_per_message_ms` | 0.06194 | from results/calibration.json |
+  | `postgres_fdw.semijoin_per_row_us` | 0.54819 | from results/calibration.json |
+  | `postgres_fdw.semijoin_t_build_us` | 0.245 | from results/calibration.json |
+
+- A new boolean option **`semijoin_filter`** for a server or a foreign table, default false (opt-in). As with `use_remote_estimate`, a value set on the table wins over the server's value.
+- At the end of `_PG_init`, the old `planner_hook` is saved in `prev_planner_hook` and ours is installed.
+
+**`contrib/postgres_fdw/postgres_fdw.h`** (changed): `extern` declarations of the GUC variables, the three `SEMIJOIN_PATH_*` values, `prev_planner_hook` and `pgfdw_semijoin_planner`. The hook's signature is copied from `planner_hook_type` in `src/include/optimizer/planner.h`.
+
+**`contrib/postgres_fdw/semijoin.c`** (new): the hook and all its helpers (see the next section).
+
+**`contrib/postgres_fdw/Makefile`, `meson.build`**: `semijoin.o` / `semijoin.c` added.
+
+**`setup/enable_semijoin.sql`** (new) and **`setup/setup_all.sh`** (new step 6): `ALTER DATABASE site_a SET session_preload_libraries = 'postgres_fdw'` and `ALTER SERVER site_b_srv OPTIONS (ADD semijoin_filter 'true')`. Before this, `setup_all.sh` dropped site_a and lost both settings.
+
+**`queries/correctness_auto.sql`, `correctness_auto_one.sql`** (new): the correctness test of the automatic rewrite.
+
+**`patches/postgres_fdw-semijoin.patch`** (new): the exported change.
+
+### The hook, step by step (`semijoin.c`)
+
+`pgfdw_semijoin_planner` is called for **every** query that PostgreSQL plans. A static flag `in_semijoin_hook` makes sure it never starts its own work again while it is already running. At the end it always calls `prev_planner_hook` (if another module had one) or `standard_planner`.
+
+1. **`find_candidate`**: is this query safe to rewrite? Everything below must hold, otherwise nothing changes:
+   - a plain `SELECT`: no UNION/INTERSECT/EXCEPT, no `FOR UPDATE`, no data-modifying `WITH`;
+   - the range table has exactly one local table (`RELKIND_RELATION`, without row-level security or TABLESAMPLE) and one foreign table. JOIN entries and PostgreSQL 18's GROUP entry are ignored, so `GROUP BY` works;
+   - the foreign table uses postgres_fdw, `semijoin_filter = true`, the server's `extensions` option lists `sjbloom`, and sjbloom is installed in site_a;
+   - only INNER joins; exactly one condition `local int4 = foreign int4`; no other condition uses both tables; no `sjb_contains` yet;
+   - the conditions on the local table contain no volatile function (such as `random()`), no subquery and no parameter (`$1`). **Why the volatile check matters:** the rewrite reads the local table a second time, in the sub-SELECT that collects the keys. A volatile condition can pick different rows on each read. The key list could then miss a key of a row that the main query keeps, and that result row would be lost. TABLESAMPLE is rejected for the same reason.
+2. **`collect_remote_stats`**: everything comes from site A's own statistics of the foreign table, which `ANALYZE customers` at site_a fetched from site B, so no network call is needed:
+   - `s_rows` = `reltuples` of the foreign table. If it is -1 (never analyzed), there is no rewrite, and a NOTICE "run ANALYZE customers at site_a" is printed even with verbose off;
+   - `D_remote` = `n_distinct` of the foreign join column (a negative value means a fraction of `reltuples`), and `rows_per_key = s_rows / D_remote`;
+   - `row_width` on the wire = the text widths of the foreign columns the query uses (SELECT list, conditions, GROUP BY, HAVING, plus the join column), + 7 + 4 · number of columns. An int4 counts as 7, because ids travel as text; other types use `pg_stats.avg_width`;
+   - `fetch_size` from the table or server option (default 100).
+3. **`estimate_local_keys`**: builds the SQL text `SELECT o.customer_id FROM public.orders o WHERE o.customer_id IS NOT NULL AND (<local conditions>)`. The local conditions are turned back into text with `deparse_expression` after `ChangeVarNodes`. The text is parsed with `raw_parser` + `parse_analyze_fixedparams` and planned with **`standard_planner` directly** (`planner()` would call our hook again). `r` = `plan_rows` of that plan. Then Cardenas' formula (below) turns r into n_est.
+4. **`decide_path`**: if `semijoin_force_path` is `index` or `filter`, that path is used. Otherwise `sjb_plan_choice(n_est, s_rows, rows_per_key, row_width, network_mbit, t_check_ns, t_lookup_us, per_message_ms, per_row_us, t_build_us, fetch_size)` is called directly through fmgr (`LookupFuncName` + a `FunctionCallInfo`, no SPI). The decision lives only in sjbloom's `costmodel.c`.
+5. **The new condition**: the sub-SELECT is built as SQL text, parsed, and wrapped in a `SubLink` of type `EXPR_SUBLINK`. Then it is added with `make_and_qual` to `WHERE`, and `hasSubLinks` is set:
+   - index path: a `ScalarArrayOpExpr` (`useOr = true`, operator int4 `=`), meaning `c.customer_id = ANY ((SELECT array_agg(DISTINCT o.customer_id) FROM ...))`;
+   - filter path: a call `sjb_contains((SELECT public.sjb_build_auto(array_agg(o.customer_id), <s_rows>, ...) FROM ...), c.customer_id)`. There is no DISTINCT, because `sjb_build_auto` sorts and removes repeats itself. The numbers are printed into the SQL text with `%.17g`, so nothing is rounded.
+
+   The sub-SELECT uses nothing from the outer query, so the planner makes it an **InitPlan** that runs once. postgres_fdw sends its result to site B as the parameter `$1`.
+
+Steps 2–5 run inside a **subtransaction** (`try_plan_semijoin`). If anything goes wrong there, the error is caught, the subtransaction is rolled back and the query is planned unchanged. Our feature never makes a query fail. Only a user's cancel (Ctrl-C) is passed on.
+
+**Why `session_preload_libraries`?** postgres_fdw.so is normally loaded lazily, in the middle of planning the first query that touches a foreign table. Our hook is installed when the library is loaded, which for that first query is too late. With `session_preload_libraries = 'postgres_fdw'`, the library is loaded when the session starts, before any query is planned.
+
+### Before and after
+
+The plain query above at n = 1000, with `SET postgres_fdw.enable_semijoin = off` (the original postgres_fdw):
+
+```
+Hash Join
+  Hash Cond: (c.customer_id = o.customer_id)
+  ->  Foreign Scan on public.customers c          actual rows=1000000
+        Remote SQL: SELECT customer_id, name FROM public.customers
+  ...
+Execution Time: 1464.644 ms
+```
+
+The same query with the rewrite on (the default). The NOTICE comes from `SET postgres_fdw.semijoin_verbose = on`:
+
+```
+NOTICE:  postgres_fdw semijoin: index path (cost model): n_est=949.3 (r=952, D_local=168392), s_rows=1000000, rows_per_key=1.000, row_width=33.00 (2 columns), fetch_size=100
+DETAIL:  cost model winner: index path (6.058 ms <= 159.931 ms for filter path with bloom)
+sub-SELECT: SELECT array_agg(DISTINCT o.customer_id) FROM public.orders o WHERE o.customer_id IS NOT NULL AND ((o.order_id <= 1000))
+
+Nested Loop                                        actual rows=1000
+  Join Filter: (o.customer_id = c.customer_id)
+  InitPlan 1
+    ->  Aggregate  Output: array_agg(DISTINCT o_1.customer_id) ...
+  ->  Index Scan using orders_pkey on public.orders o
+  ->  Materialize
+        ->  Foreign Scan on public.customers c   rows=10 (estimate)  actual rows=999
+              Remote SQL: SELECT customer_id, name FROM public.customers WHERE ((customer_id = ANY ($1::integer[])))
+Execution Time: 263.485 ms
+```
+
+At n = 100000 the cost model picks the filter path, and `sjb_build_auto` builds a Bloom filter when the query runs:
+
+```
+NOTICE:  postgres_fdw semijoin: filter path (cost model): n_est=75930.5 (r=100951, D_local=168392), ...
+DETAIL:  cost model winner: filter path with bloom (289.421 ms < 477.191 ms for index path)
+  ->  Foreign Scan on public.customers c   actual rows=96509
+        Remote SQL: SELECT customer_id, name FROM public.customers WHERE (public.sjb_contains($1::bytea, customer_id))
+```
+
+### Cardenas' formula: how many distinct keys will we send?
+
+The planner only estimates **rows** (r), but the filter and the key list depend on **distinct keys** (n). Cardenas (A. F. Cardenas, "Analysis and Performance of Inverted Data Base Structures", CACM 18(5), 1975) gives the expected number of distinct values when r rows are picked from a column with D distinct values:
+
+```
+n = D * (1 - (1 - 1/D)^r)
+```
+
+In plain words: one picked row misses a given value with probability (1 - 1/D), so all r rows miss it with probability (1 - 1/D)^r. Every one of the D values is found with probability 1 - (1 - 1/D)^r.
+
+**Worked example (n = 1000):** `D_local` = n_distinct of orders.customer_id = 168,392 (ANALYZE's estimate), and `r` = 952 (the planner's estimate for `order_id <= 1000`).
+- (1 - 1/168392)^952 = e^(952 · ln(1 - 1/168392)) ≈ e^(-0.0056535) ≈ 0.994363
+- n_est = 168392 · (1 - 0.994363) = 168392 · 0.005637 ≈ **949.3**. The true number is 999.
+
+The same formula is a rougher estimate for big n:
+
+| n (order_id <=) | r (planner) | n_est (Cardenas) | true distinct keys | path (auto) | join above the Foreign Scan |
+|---|---|---|---|---|---|
+| 100 | 95 | 95.0 | 100 | index | Nested Loop + Join Filter |
+| 1000 | 952 | 949.3 | 999 | index | Nested Loop + Join Filter |
+| 10000 | 10351 | 10039.3 | 9955 | index | Hash Join |
+| 100000 | 100951 | 75930.5 | 95017 | filter (bloom) | Hash Join |
+| 150000 | 150166 | 99362.9 | 139294 | filter (bloom) | Hash Join |
+
+At n = 150000 the estimate is 29% too low, for two reasons. ANALYZE's D (168,392) is below the true 181,329. And Cardenas assumes the r rows pick values "with replacement", whereas we take r of only 200,000 rows, most of which have their own key. Near the whole table this finds almost all keys, while the formula says only 1 - e^(-r/D) of them. Here the error does not change the decision (the filter path wins either way), and it never affects correctness. Batch 7 can look at a formula for picking without replacement (e.g. Yao, 1977).
+
+**Nested Loop at n ≤ 1000:** the planner guesses 10 rows for `customer_id = ANY ($1)` (the real number is 999), so it puts a Nested Loop with a Join Filter above the Foreign Scan (1000 × 999 comparisons). This is the same estimate problem as in Batch 4. It is recorded here, and Batch 7 will fix the estimates.
+
+### Known limitations (version 1)
+
+- Queries with parameters in local conditions (`$1` of a prepared statement, PL/pgSQL variables) are not rewritten.
+- `sjb_plan_choice` has no max_filter_bytes argument and always assumes 1 MB. `semijoin_max_filter_kb` only reaches `sjb_build_auto`. With the default (1024 kB) the two agree.
+- A foreign column that is used only in a condition shipped to site B (e.g. `c.city = 'X'`) is counted in `row_width`, although postgres_fdw does not fetch it. The width is then a little too high.
+
+### How to test it
+
+```bash
+source setup/env.example.sh                     # PGUSER=postgres: the user mapping is for postgres
+make -C ~/postgres/postgresql/contrib/postgres_fdw && make -C ~/postgres/postgresql/contrib/postgres_fdw install
+psql -X -d site_a -f setup/enable_semijoin.sql  # only on an existing setup; setup_all.sh does it as step 6
+psql -X -d site_a -f queries/correctness_auto.sql   # about 50 s; every off_except_on / on_except_off = 0
+```
+
+`correctness_auto.sql` runs a join query and a GROUP BY query (`c.city, count(*), sum(o.amount)`) for n = 100, 10000 and 150000, each with `semijoin_force_path` = auto, index and filter. Each query runs into a temp table with the rewrite off and again with it on, and the two tables are compared with EXCEPT ALL in both directions. (A single `query EXCEPT ALL query` is a set operation, which the hook never rewrites.) All 18 comparisons gave 0 and 0.
+
+To see a decision, run `SET postgres_fdw.semijoin_verbose = on;` and then `EXPLAIN (VERBOSE)` of the plain query. To compare with the original behaviour, run `SET postgres_fdw.enable_semijoin = off;`.

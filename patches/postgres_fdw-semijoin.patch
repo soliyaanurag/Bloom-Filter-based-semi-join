@@ -1,0 +1,1927 @@
+diff --git a/contrib/postgres_fdw/Makefile b/contrib/postgres_fdw/Makefile
+index 8eaf4d263b..af714b2d80 100644
+--- a/contrib/postgres_fdw/Makefile
++++ b/contrib/postgres_fdw/Makefile
+@@ -7,6 +7,7 @@ OBJS = \
+ 	deparse.o \
+ 	option.o \
+ 	postgres_fdw.o \
++	semijoin.o \
+ 	shippable.o
+ PGFILEDESC = "postgres_fdw - foreign data wrapper for PostgreSQL"
+ 
+diff --git a/contrib/postgres_fdw/meson.build b/contrib/postgres_fdw/meson.build
+index c96030ca08..6262c2e02b 100644
+--- a/contrib/postgres_fdw/meson.build
++++ b/contrib/postgres_fdw/meson.build
+@@ -5,6 +5,7 @@ postgres_fdw_sources = files(
+   'deparse.c',
+   'option.c',
+   'postgres_fdw.c',
++  'semijoin.c',
+   'shippable.c',
+ )
+ 
+diff --git a/contrib/postgres_fdw/option.c b/contrib/postgres_fdw/option.c
+index 0ab1fd7018..8c16318cda 100644
+--- a/contrib/postgres_fdw/option.c
++++ b/contrib/postgres_fdw/option.c
+@@ -19,6 +19,7 @@
+ #include "commands/defrem.h"
+ #include "commands/extension.h"
+ #include "libpq/libpq-be.h"
++#include "optimizer/planner.h"
+ #include "postgres_fdw.h"
+ #include "utils/guc.h"
+ #include "utils/varlena.h"
+@@ -50,6 +51,46 @@ static PQconninfoOption *libpq_options;
+  */
+ char	   *pgfdw_application_name = NULL;
+ 
++/*
++ * CS631 semijoin GUC parameters (used by semijoin.c).
++ *
++ * The cost constants below were measured on our test machine by
++ * bench/calibrate.py and stored in results/calibration.json (section
++ * "suggested", run of 2026-10-16, max_parallel_workers_per_gather = 0).
++ * They are only defaults: every user can SET them for their own setup.
++ */
++bool		pgfdw_enable_semijoin = true;
++int			pgfdw_semijoin_force_path = SEMIJOIN_PATH_AUTO;
++bool		pgfdw_semijoin_verbose = false;
++double		pgfdw_semijoin_network_mbit = 1000.0;
++int			pgfdw_semijoin_max_filter_kb = 1024;
++
++/* calibration.json: suggested.t_check_ns (one sjb_contains call at B) */
++double		pgfdw_semijoin_t_check_ns = 158.19;
++
++/* calibration.json: suggested.t_lookup_us (one index lookup, end to end) */
++double		pgfdw_semijoin_t_lookup_us = 4.7956;
++
++/* calibration.json: suggested.per_message_ms (one FETCH round trip) */
++double		pgfdw_semijoin_per_message_ms = 0.06194;
++
++/* calibration.json: suggested.per_row_us (handling one returned row) */
++double		pgfdw_semijoin_per_row_us = 0.54819;
++
++/* calibration.json: suggested.t_build_us (adding one key to a filter at A) */
++double		pgfdw_semijoin_t_build_us = 0.245;
++
++/*
++ * The allowed values of postgres_fdw.semijoin_force_path. Each entry is
++ * {name the user types, value stored in the C variable, hidden?}.
++ */
++static const struct config_enum_entry semijoin_force_path_options[] = {
++	{"auto", SEMIJOIN_PATH_AUTO, false},
++	{"index", SEMIJOIN_PATH_INDEX, false},
++	{"filter", SEMIJOIN_PATH_FILTER, false},
++	{NULL, 0, false}
++};
++
+ /*
+  * Helper functions
+  */
+@@ -126,7 +167,8 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
+ 			strcmp(def->defname, "parallel_commit") == 0 ||
+ 			strcmp(def->defname, "parallel_abort") == 0 ||
+ 			strcmp(def->defname, "keep_connections") == 0 ||
+-			strcmp(def->defname, "use_scram_passthrough") == 0)
++			strcmp(def->defname, "use_scram_passthrough") == 0 ||
++			strcmp(def->defname, "semijoin_filter") == 0)
+ 		{
+ 			/* these accept only boolean values */
+ 			(void) defGetBoolean(def);
+@@ -283,6 +325,13 @@ InitPgFdwOptions(void)
+ 		{"use_scram_passthrough", ForeignServerRelationId, false},
+ 		{"use_scram_passthrough", UserMappingRelationId, false},
+ 
++		/*
++		 * CS631: semijoin_filter (opt-in) is available on both server and
++		 * table; the table's value wins, like use_remote_estimate.
++		 */
++		{"semijoin_filter", ForeignServerRelationId, false},
++		{"semijoin_filter", ForeignTableRelationId, false},
++
+ 		/*
+ 		 * sslcert and sslkey are in fact libpq options, but we repeat them
+ 		 * here to allow them to appear in both foreign server context (when
+@@ -596,5 +645,145 @@ _PG_init(void)
+ 							   NULL,
+ 							   NULL);
+ 
++	/*
++	 * CS631 semijoin settings. DefineCustomBoolVariable (and the Enum, Real
++	 * and Int versions) registers a new setting that users can change with
++	 * SET. PGC_USERSET means any user may change it in their own session.
++	 */
++	DefineCustomBoolVariable("postgres_fdw.enable_semijoin",
++							 "Enables the automatic semijoin rewrite of local-foreign joins.",
++							 NULL,
++							 &pgfdw_enable_semijoin,
++							 true,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomEnumVariable("postgres_fdw.semijoin_force_path",
++							 "Forces the semijoin path: auto (cost model), index or filter.",
++							 "Meant for tests and demonstrations.",
++							 &pgfdw_semijoin_force_path,
++							 SEMIJOIN_PATH_AUTO,
++							 semijoin_force_path_options,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomBoolVariable("postgres_fdw.semijoin_verbose",
++							 "Prints a NOTICE explaining every semijoin decision.",
++							 NULL,
++							 &pgfdw_semijoin_verbose,
++							 false,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_network_mbit",
++							 "Network bandwidth between the two sites, in Mbit/s.",
++							 NULL,
++							 &pgfdw_semijoin_network_mbit,
++							 1000.0,
++							 0.001,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	/* GUC_UNIT_KB: the value is in kB, and users may write '2MB' etc. */
++	DefineCustomIntVariable("postgres_fdw.semijoin_max_filter_kb",
++							"Largest filter (Bloom or exact key list) that may be sent.",
++							NULL,
++							&pgfdw_semijoin_max_filter_kb,
++							1024,
++							0,
++							1048576,
++							PGC_USERSET,
++							GUC_UNIT_KB,
++							NULL,
++							NULL,
++							NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_t_check_ns",
++							 "Time of one sjb_contains check at the remote site, in ns.",
++							 NULL,
++							 &pgfdw_semijoin_t_check_ns,
++							 158.19,
++							 0.0,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_t_lookup_us",
++							 "Time of one index lookup through postgres_fdw, in microseconds.",
++							 NULL,
++							 &pgfdw_semijoin_t_lookup_us,
++							 4.7956,
++							 0.0,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_per_message_ms",
++							 "Time of one FETCH round trip, in ms.",
++							 NULL,
++							 &pgfdw_semijoin_per_message_ms,
++							 0.06194,
++							 0.0,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_per_row_us",
++							 "Time to handle one returned row, in microseconds.",
++							 NULL,
++							 &pgfdw_semijoin_per_row_us,
++							 0.54819,
++							 0.0,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomRealVariable("postgres_fdw.semijoin_t_build_us",
++							 "Time to add one key to a filter at the local site, in microseconds.",
++							 NULL,
++							 &pgfdw_semijoin_t_build_us,
++							 0.245,
++							 0.0,
++							 1000000000.0,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
+ 	MarkGUCPrefixReserved("postgres_fdw");
++
++	/*
++	 * CS631: install our planner hook. planner_hook is a global function
++	 * pointer that PostgreSQL calls (if it is set) instead of
++	 * standard_planner. Another module may already have set it, so we save
++	 * the old value and our hook calls it when it is done.
++	 */
++	prev_planner_hook = planner_hook;
++	planner_hook = pgfdw_semijoin_planner;
+ }
+diff --git a/contrib/postgres_fdw/postgres_fdw.h b/contrib/postgres_fdw/postgres_fdw.h
+index 81358f3bde..bcc2603dad 100644
+--- a/contrib/postgres_fdw/postgres_fdw.h
++++ b/contrib/postgres_fdw/postgres_fdw.h
+@@ -18,6 +18,7 @@
+ #include "libpq-fe.h"
+ #include "nodes/execnodes.h"
+ #include "nodes/pathnodes.h"
++#include "optimizer/planner.h"
+ #include "utils/relcache.h"
+ 
+ /*
+@@ -178,6 +179,25 @@ extern List *ExtractExtensionList(const char *extensionsString,
+ extern char *process_pgfdw_appname(const char *appname);
+ extern char *pgfdw_application_name;
+ 
++/*
++ * CS631 semijoin settings (GUCs), defined in option.c.
++ * The values of postgres_fdw.semijoin_force_path:
++ */
++#define SEMIJOIN_PATH_AUTO		0	/* the cost model decides */
++#define SEMIJOIN_PATH_INDEX		1	/* always "key = ANY(key list)" */
++#define SEMIJOIN_PATH_FILTER	2	/* always "sjb_contains(filter, key)" */
++
++extern bool pgfdw_enable_semijoin;
++extern int	pgfdw_semijoin_force_path;
++extern bool pgfdw_semijoin_verbose;
++extern double pgfdw_semijoin_network_mbit;
++extern int	pgfdw_semijoin_max_filter_kb;
++extern double pgfdw_semijoin_t_check_ns;
++extern double pgfdw_semijoin_t_lookup_us;
++extern double pgfdw_semijoin_per_message_ms;
++extern double pgfdw_semijoin_per_row_us;
++extern double pgfdw_semijoin_t_build_us;
++
+ /* in deparse.c */
+ extern void classifyConditions(PlannerInfo *root,
+ 							   RelOptInfo *baserel,
+@@ -253,6 +273,22 @@ extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
+ 									List **retrieved_attrs, List **params_list);
+ extern const char *get_jointype_name(JoinType jointype);
+ 
++/*
++ * in semijoin.c (CS631)
++ *
++ * pgfdw_semijoin_planner has exactly the signature of planner_hook_type in
++ * src/include/optimizer/planner.h:
++ *   PlannedStmt *(*planner_hook_type) (Query *parse,
++ *                                      const char *query_string,
++ *                                      int cursorOptions,
++ *                                      ParamListInfo boundParams);
++ */
++extern planner_hook_type prev_planner_hook;
++extern PlannedStmt *pgfdw_semijoin_planner(Query *parse,
++										   const char *query_string,
++										   int cursorOptions,
++										   ParamListInfo boundParams);
++
+ /* in shippable.c */
+ extern bool is_builtin(Oid objectId);
+ extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
+diff --git a/contrib/postgres_fdw/semijoin.c b/contrib/postgres_fdw/semijoin.c
+new file mode 100644
+index 0000000000..046407090e
+--- /dev/null
++++ b/contrib/postgres_fdw/semijoin.c
+@@ -0,0 +1,1607 @@
++/*-------------------------------------------------------------------------
++ *
++ * semijoin.c
++ *		  CS631 project: automatic semijoin rewrite for postgres_fdw.
++ *
++ * Role of this file in the project
++ * --------------------------------
++ * Site A joins a local table R (orders) with a foreign table S (customers)
++ * that lives at site B. Normally postgres_fdw fetches ALL of S. This file
++ * installs a planner hook that looks at every query before it is planned
++ * and, for a simple join "local.key = foreign.key", adds one more condition
++ * on the foreign table, so that site B sends back only the rows that can
++ * match.
++ *
++ * The steps, for every query:
++ *   1. find_candidate: is it "local JOIN foreign ON local.k = foreign.k"
++ *      (int4) with safe conditions? If not, nothing changes.
++ *   2. collect_remote_stats: size of S, rows per key, width of a row on
++ *      the wire (from site A's statistics of the foreign table).
++ *   3. estimate_local_keys: how many distinct keys n will the local rows
++ *      have? (planner row estimate + Cardenas' formula)
++ *   4. decide_path: index path or filter path (sjbloom's sjb_plan_choice,
++ *      or the setting postgres_fdw.semijoin_force_path).
++ *   5. the rewrite: one new condition on the foreign key is added to WHERE:
++ *        index path:  foreign.k = ANY ((SELECT array_agg(DISTINCT k)
++ *                                       FROM local WHERE ...))
++ *        filter path: sjb_contains((SELECT sjb_build_auto(array_agg(k), ...)
++ *                                   FROM local WHERE ...), foreign.k)
++ *      The planner turns the sub-SELECT into an InitPlan, and postgres_fdw
++ *      sends its result to site B as the parameter $1.
++ * The join itself is not changed, so the result is always exactly the
++ * same: the new condition only removes foreign rows that cannot join.
++ *
++ * If anything goes wrong in steps 2-5, the query is left unchanged: our
++ * feature never makes a query fail.
++ *
++ * IDENTIFICATION
++ *		  contrib/postgres_fdw/semijoin.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <math.h>
++
++#include "access/htup_details.h"
++#include "access/sysattr.h"
++#include "access/xact.h"
++#include "catalog/pg_class.h"
++#include "catalog/pg_operator.h"
++#include "catalog/pg_statistic.h"
++#include "catalog/pg_type.h"
++#include "commands/defrem.h"
++#include "commands/extension.h"
++#include "foreign/foreign.h"
++#include "lib/stringinfo.h"
++#include "nodes/makefuncs.h"
++#include "nodes/nodeFuncs.h"
++#include "optimizer/optimizer.h"
++#include "optimizer/planner.h"
++#include "parser/analyze.h"
++#include "parser/parse_func.h"
++#include "parser/parser.h"
++#include "postgres_fdw.h"
++#include "rewrite/rewriteManip.h"
++#include "utils/builtins.h"
++#include "utils/guc.h"
++#include "utils/lsyscache.h"
++#include "utils/resowner.h"
++#include "utils/ruleutils.h"
++#include "utils/syscache.h"
++
++/*
++ * Width of one int4 join key as text on the wire. postgres_fdw sends
++ * values as text, and our ids have 6-7 digits (see CLAUDE.md: pg_stats
++ * says 4 bytes, the stored width, which is wrong for the wire).
++ */
++#define SJB_INT4_TEXT_WIDTH 7
++
++/*
++ * Protocol overhead of one returned row: a DataRow message has a 7-byte
++ * header and 4 bytes (a length) per column.
++ */
++#define SJB_ROW_OVERHEAD_BYTES 7
++#define SJB_COLUMN_OVERHEAD_BYTES 4
++
++/* postgres_fdw sends a bytea filter as hex text: 2 characters per byte */
++#define SJB_WIRE_FACTOR 2.0
++
++/* postgres_fdw's default fetch_size (rows per FETCH) */
++#define SJB_DEFAULT_FETCH_SIZE 100
++
++/*
++ * The planner hook that was installed before ours (or NULL). option.c sets
++ * it in _PG_init, and our hook calls it at the end.
++ */
++planner_hook_type prev_planner_hook = NULL;
++
++/*
++ * True while our hook is running. If something inside our hook ever asks
++ * for a query to be planned, we must not start our own work again.
++ */
++static bool in_semijoin_hook = false;
++
++/*
++ * Everything find_candidate learns about a query that we can rewrite.
++ */
++typedef struct SjbCandidate
++{
++	/* the local table (R) */
++	Index		local_varno;	/* its position in q->rtable (1-based) */
++	Oid			local_relid;	/* its OID */
++	AttrNumber	local_attno;	/* column number of its join key */
++	char	   *local_alias;	/* its name in the query, e.g. "o" */
++	bool		local_inh;		/* false if the query said FROM ONLY */
++
++	/* the foreign table (S) */
++	Index		foreign_varno;
++	Oid			foreign_relid;
++	AttrNumber	foreign_attno;
++	Var		   *foreign_var;	/* the foreign side of "local = foreign" */
++
++	/* conditions that use only the local table (or no table at all) */
++	List	   *local_quals;
++
++	/* OID of the sjbloom extension at site A, and its schema's name */
++	Oid			sjbloom_oid;
++	char	   *sjbloom_schema;
++
++	/* filled in when the query is NOT a candidate: why not */
++	const char *reject_reason;
++
++	/* true if reject_reason must be shown even when verbose is off */
++	bool		always_report;
++
++	/* true if the query uses at least one foreign table */
++	bool		uses_foreign_table;
++} SjbCandidate;
++
++/*
++ * The numbers the cost model needs (steps 2 and 3).
++ */
++typedef struct SjbStats
++{
++	double		s_rows;			/* rows of the foreign table S */
++	double		d_remote;		/* distinct join keys in S */
++	double		rows_per_key;	/* s_rows / d_remote */
++	double		row_width;		/* bytes of one returned row on the wire */
++	int			num_columns;	/* foreign columns the query fetches */
++	int			fetch_size;		/* rows per FETCH (postgres_fdw option) */
++	double		r_local;		/* local rows after the local conditions */
++	double		d_local;		/* distinct join keys in the local table */
++	double		n_est;			/* estimated distinct keys we will send */
++} SjbStats;
++
++/*
++ * Used by table_refs_walker: which tables a condition uses.
++ */
++typedef struct TableRefs
++{
++	Index		local_varno;
++	Index		foreign_varno;
++	bool		uses_local;		/* a Var of the local table was found */
++	bool		uses_foreign;	/* a Var of the foreign table was found */
++	bool		uses_other;		/* a Var of another range table entry */
++} TableRefs;
++
++
++/*
++ * split_and_clauses
++ *
++ * What it does: splits a condition "A AND B AND C" into its parts and
++ * appends each part to *clauses. A condition that is not an AND is
++ * appended as it is.
++ *
++ * Inputs:  node    - a condition (may be NULL: then nothing is added)
++ *          clauses - the list to append to
++ * Output:  *clauses grows
++ *
++ * Why it exists: in the query tree, WHERE a AND b is one BoolExpr node.
++ * We want to look at each condition on its own.
++ */
++static void
++split_and_clauses(Node *node, List **clauses)
++{
++	if (node == NULL)
++		return;
++
++	/*
++	 * IsA(node, BoolExpr) checks the node's type tag. Every node in a
++	 * query tree starts with such a tag.
++	 */
++	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == AND_EXPR)
++	{
++		BoolExpr   *and_expr = (BoolExpr *) node;
++		ListCell   *cell;
++
++		/* foreach walks a PostgreSQL List; lfirst(cell) is the element */
++		foreach(cell, and_expr->args)
++			split_and_clauses((Node *) lfirst(cell), clauses);
++		return;
++	}
++
++	/* lappend adds one element at the end of a List (NIL = empty list) */
++	*clauses = lappend(*clauses, node);
++}
++
++/*
++ * collect_join_tree_quals
++ *
++ * What it does: walks the FROM part of the query (the "join tree") and
++ * collects all conditions: the WHERE condition and the ON conditions of
++ * INNER JOINs.
++ *
++ * Inputs:  node    - a part of the join tree (FromExpr, JoinExpr or
++ *                    RangeTblRef)
++ *          clauses - the list to append the conditions to
++ * Output:  true if everything is fine; false if the join tree has
++ *          something we do not support (for example a LEFT JOIN)
++ *
++ * Why it exists: for an INNER JOIN, a condition written in ON means the
++ * same as in WHERE, so we treat both the same way. A LEFT/RIGHT/FULL
++ * join can NOT be rewritten: the foreign rows that we would remove may be
++ * needed (with NULLs) in the result.
++ */
++static bool
++collect_join_tree_quals(Node *node, List **clauses)
++{
++	ListCell   *cell;
++
++	if (node == NULL)
++		return true;
++
++	if (IsA(node, RangeTblRef))
++		return true;			/* just a table: no condition here */
++
++	if (IsA(node, FromExpr))
++	{
++		FromExpr   *from = (FromExpr *) node;
++
++		foreach(cell, from->fromlist)
++		{
++			if (!collect_join_tree_quals((Node *) lfirst(cell), clauses))
++				return false;
++		}
++		split_and_clauses(from->quals, clauses);
++		return true;
++	}
++
++	if (IsA(node, JoinExpr))
++	{
++		JoinExpr   *join = (JoinExpr *) node;
++
++		if (join->jointype != JOIN_INNER)
++			return false;
++		if (!collect_join_tree_quals(join->larg, clauses))
++			return false;
++		if (!collect_join_tree_quals(join->rarg, clauses))
++			return false;
++		split_and_clauses(join->quals, clauses);
++		return true;
++	}
++
++	return false;				/* unknown kind of node: do not risk it */
++}
++
++/*
++ * table_refs_walker
++ *
++ * What it does: looks at every node inside a condition and records in
++ * *refs which tables its column references (Vars) belong to.
++ *
++ * Inputs:  node - the current node; refs - the TableRefs to fill in
++ * Output:  always false (false means "keep walking")
++ *
++ * Why it exists: we must know if a condition uses only the local table,
++ * only the foreign table, or both. expression_tree_walker calls this
++ * function for every node of the expression.
++ */
++static bool
++table_refs_walker(Node *node, TableRefs *refs)
++{
++	if (node == NULL)
++		return false;
++
++	if (IsA(node, Var))
++	{
++		Var		   *var = (Var *) node;
++
++		/* varlevelsup > 0 would mean a Var of an outer query */
++		if (var->varlevelsup != 0)
++			refs->uses_other = true;
++		else if (var->varno == refs->local_varno)
++			refs->uses_local = true;
++		else if (var->varno == refs->foreign_varno)
++			refs->uses_foreign = true;
++		else
++			refs->uses_other = true;	/* e.g. a column of a JOIN entry */
++		return false;
++	}
++
++	return expression_tree_walker(node, table_refs_walker, refs);
++}
++
++/*
++ * contains_param_walker
++ *
++ * What it does: returns true if the expression contains a Param node (a
++ * query parameter such as $1 of a prepared statement).
++ *
++ * Inputs:  node - the expression; context - unused
++ * Output:  true if a Param was found
++ *
++ * Why it exists: we will copy local conditions into a new SQL text. A
++ * parameter has no value at that point, so we cannot copy it.
++ */
++static bool
++contains_param_walker(Node *node, void *context)
++{
++	if (node == NULL)
++		return false;
++	if (IsA(node, Param))
++		return true;
++	return expression_tree_walker(node, contains_param_walker, context);
++}
++
++/*
++ * contains_sjb_contains_walker
++ *
++ * What it does: returns true if the expression calls a function named
++ * sjb_contains.
++ *
++ * Inputs:  node - the expression; context - unused
++ * Output:  true if sjb_contains is called somewhere
++ *
++ * Why it exists: a query that already uses a semijoin filter (for example
++ * one written by hand, like queries/bloom_manual.sql) must not get a
++ * second one.
++ */
++static bool
++contains_sjb_contains_walker(Node *node, void *context)
++{
++	if (node == NULL)
++		return false;
++	if (IsA(node, FuncExpr))
++	{
++		FuncExpr   *func = (FuncExpr *) node;
++		char	   *name = get_func_name(func->funcid);
++
++		if (name != NULL && strcmp(name, "sjb_contains") == 0)
++			return true;
++	}
++	return expression_tree_walker(node, contains_sjb_contains_walker, context);
++}
++
++/*
++ * is_join_clause
++ *
++ * What it does: checks if a condition is exactly
++ * "local_column = foreign_column" with the int4 equality operator, and if
++ * so returns the two columns.
++ *
++ * Inputs:  clause - a condition; c - the candidate (tables already known)
++ * Output:  true if it is such a condition; then *local_var and
++ *          *foreign_var point to the two columns
++ *
++ * Why it exists: version 1 supports only one int4 equality join.
++ */
++static bool
++is_join_clause(Node *clause, SjbCandidate *c, Var **local_var, Var **foreign_var)
++{
++	OpExpr	   *op;
++	Var		   *left;
++	Var		   *right;
++
++	if (!IsA(clause, OpExpr))
++		return false;
++	op = (OpExpr *) clause;
++
++	/* Int4EqualOperator is the OID of "int4 = int4" (from pg_operator) */
++	if (op->opno != Int4EqualOperator || list_length(op->args) != 2)
++		return false;
++
++	/* linitial / lsecond are the first / second element of a List */
++	if (!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
++		return false;
++	left = (Var *) linitial(op->args);
++	right = (Var *) lsecond(op->args);
++
++	if (left->varlevelsup != 0 || right->varlevelsup != 0)
++		return false;
++
++	if (left->varno == c->local_varno && right->varno == c->foreign_varno)
++	{
++		*local_var = left;
++		*foreign_var = right;
++		return true;
++	}
++	if (left->varno == c->foreign_varno && right->varno == c->local_varno)
++	{
++		*local_var = right;
++		*foreign_var = left;
++		return true;
++	}
++	return false;
++}
++
++/*
++ * find_tables
++ *
++ * What it does: looks at the query's range table (the list of tables and
++ * joins in FROM) and finds the one local table and the one foreign table.
++ *
++ * Inputs:  q - the query; c - the candidate to fill in
++ * Output:  true if there are exactly one local table and one foreign
++ *          table (plus any number of JOIN entries); c->local_* and
++ *          c->foreign_* are set
++ *
++ * Why it exists: version 1 supports only "one local table JOIN one
++ * foreign table".
++ */
++static bool
++find_tables(Query *q, SjbCandidate *c)
++{
++	ListCell   *cell;
++	int			num_relations = 0;
++	Index		rt_index = 0;
++
++	foreach(cell, q->rtable)
++	{
++		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
++
++		rt_index++;
++		/*
++		 * A JOIN entry is not a table: ignore it. The same for the GROUP
++		 * entry that PostgreSQL 18 adds for GROUP BY: our new condition
++		 * goes into WHERE, which runs before grouping, and only removes
++		 * foreign rows that cannot join, so the groups do not change.
++		 */
++		if (rte->rtekind == RTE_JOIN || rte->rtekind == RTE_GROUP)
++			continue;
++		if (rte->rtekind != RTE_RELATION)
++		{
++			c->reject_reason = "the query uses something other than tables (subquery, function, ...)";
++			return false;
++		}
++
++		num_relations++;
++		if (rte->relkind == RELKIND_FOREIGN_TABLE)
++		{
++			c->foreign_varno = rt_index;
++			c->foreign_relid = rte->relid;
++		}
++		else if (rte->relkind == RELKIND_RELATION)
++		{
++			/*
++			 * Row-level security adds hidden conditions (securityQuals). We
++			 * would read the table again without them, so we do not try.
++			 * TABLESAMPLE picks random rows: reading the table twice would
++			 * not give the same rows (same problem as volatile functions).
++			 */
++			if (rte->securityQuals != NIL || rte->tablesample != NULL)
++			{
++				c->reject_reason = "the local table has row-level security or TABLESAMPLE";
++				return false;
++			}
++			c->local_varno = rt_index;
++			c->local_relid = rte->relid;
++			c->local_alias = rte->eref->aliasname;
++			c->local_inh = rte->inh;
++		}
++	}
++
++	if (num_relations != 2 || c->local_varno == 0 || c->foreign_varno == 0)
++	{
++		c->reject_reason = "the query does not join exactly one local table with one foreign table";
++		return false;
++	}
++	return true;
++}
++
++/*
++ * server_allows_semijoin
++ *
++ * What it does: checks that the foreign table belongs to postgres_fdw,
++ * that the option semijoin_filter is true for it, and that the server's
++ * "extensions" option lists sjbloom.
++ *
++ * Inputs:  c - the candidate (foreign_relid and sjbloom_oid are set)
++ * Output:  true if all three hold
++ *
++ * Why it exists: the feature is opt-in per server or per table, and the
++ * filter function can only be sent to site B if postgres_fdw is told that
++ * sjbloom is installed there ("extensions" option).
++ */
++static bool
++server_allows_semijoin(SjbCandidate *c)
++{
++	ForeignTable *table = GetForeignTable(c->foreign_relid);
++	ForeignServer *server = GetForeignServer(table->serverid);
++	ForeignDataWrapper *wrapper = GetForeignDataWrapper(server->fdwid);
++	char	   *handler_name;
++	bool		semijoin_filter = false;
++	bool		sjbloom_listed = false;
++	ListCell   *cell;
++
++	handler_name = get_func_name(wrapper->fdwhandler);
++	if (handler_name == NULL || strcmp(handler_name, "postgres_fdw_handler") != 0)
++	{
++		c->reject_reason = "the foreign table does not use postgres_fdw";
++		return false;
++	}
++
++	/* Server options: semijoin_filter and extensions. */
++	foreach(cell, server->options)
++	{
++		/* each option is a DefElem: a name (defname) and a value */
++		DefElem    *def = (DefElem *) lfirst(cell);
++
++		if (strcmp(def->defname, "semijoin_filter") == 0)
++			semijoin_filter = defGetBoolean(def);
++		if (strcmp(def->defname, "extensions") == 0)
++		{
++			List	   *extension_oids = ExtractExtensionList(defGetString(def), false);
++
++			if (list_member_oid(extension_oids, c->sjbloom_oid))
++				sjbloom_listed = true;
++		}
++	}
++
++	/* A table option semijoin_filter overrides the server's value. */
++	foreach(cell, table->options)
++	{
++		DefElem    *def = (DefElem *) lfirst(cell);
++
++		if (strcmp(def->defname, "semijoin_filter") == 0)
++			semijoin_filter = defGetBoolean(def);
++	}
++
++	if (!semijoin_filter)
++	{
++		c->reject_reason = "semijoin_filter is not true for this server/table";
++		return false;
++	}
++	if (!sjbloom_listed)
++	{
++		c->reject_reason = "the server's \"extensions\" option does not list sjbloom";
++		return false;
++	}
++	return true;
++}
++
++/*
++ * check_conditions
++ *
++ * What it does: looks at every condition of the query. It must find
++ * exactly one join condition "local.key = foreign.key" (int4), and every
++ * other condition must use only one of the two tables. Conditions on the
++ * local table are saved in c->local_quals.
++ *
++ * Inputs:  q - the query; c - the candidate (tables already known)
++ * Output:  true if the conditions are fine
++ *
++ * Why it exists: these are the rules that make the rewrite safe.
++ */
++static bool
++check_conditions(Query *q, SjbCandidate *c)
++{
++	List	   *clauses = NIL;
++	ListCell   *cell;
++	int			num_join_clauses = 0;
++
++	if (!collect_join_tree_quals((Node *) q->jointree, &clauses))
++	{
++		c->reject_reason = "the query uses a join that is not an INNER JOIN";
++		return false;
++	}
++
++	foreach(cell, clauses)
++	{
++		Node	   *clause = (Node *) lfirst(cell);
++		Var		   *local_var;
++		Var		   *foreign_var;
++		TableRefs	refs;
++
++		if (contains_sjb_contains_walker(clause, NULL))
++		{
++			c->reject_reason = "the query already uses sjb_contains";
++			return false;
++		}
++
++		if (is_join_clause(clause, c, &local_var, &foreign_var))
++		{
++			num_join_clauses++;
++			c->local_attno = local_var->varattno;
++			c->foreign_attno = foreign_var->varattno;
++			c->foreign_var = foreign_var;
++			continue;
++		}
++
++		/*
++		 * A subquery (SubLink) may refer to any table, which our simple
++		 * walker cannot see reliably. We do not try.
++		 */
++		if (checkExprHasSubLink(clause))
++		{
++			c->reject_reason = "a condition contains a subquery";
++			return false;
++		}
++
++		memset(&refs, 0, sizeof(refs));
++		refs.local_varno = c->local_varno;
++		refs.foreign_varno = c->foreign_varno;
++		table_refs_walker(clause, &refs);
++
++		if (refs.uses_other || (refs.uses_local && refs.uses_foreign))
++		{
++			c->reject_reason = "another condition uses both tables";
++			return false;
++		}
++		if (refs.uses_foreign)
++			continue;			/* a condition on S alone: not our business */
++
++		/*
++		 * A condition on the local table alone (or on no table, like
++		 * "random() < 2"). We will copy it into the subquery that reads the
++		 * local table a SECOND time to collect the join keys. That is only
++		 * correct if both reads select exactly the same rows:
++		 *  - a volatile function (random(), clock_timestamp(), ...) may
++		 *    give a different answer on each read, so the key list could
++		 *    miss keys of rows the main query keeps, and the join would
++		 *    lose result rows;
++		 *  - a parameter ($1) has no value yet, so we cannot copy it.
++		 */
++		if (contain_volatile_functions(clause))
++		{
++			c->reject_reason = "a local condition contains a volatile function";
++			return false;
++		}
++		if (contains_param_walker(clause, NULL))
++		{
++			c->reject_reason = "a local condition contains a parameter ($n)";
++			return false;
++		}
++		c->local_quals = lappend(c->local_quals, clause);
++	}
++
++	if (num_join_clauses != 1)
++	{
++		c->reject_reason = "there is not exactly one \"local int4 = foreign int4\" join condition";
++		return false;
++	}
++	return true;
++}
++
++/*
++ * query_uses_foreign_table
++ *
++ * What it does: returns true if any table in the query is a foreign table.
++ * Input:  q - the query
++ * Output: true or false
++ * Why it exists: with verbose on, we explain why a query is not rewritten
++ * only for queries that use a foreign table (otherwise every catalog query
++ * of psql would print a NOTICE).
++ */
++static bool
++query_uses_foreign_table(Query *q)
++{
++	ListCell   *cell;
++
++	foreach(cell, q->rtable)
++	{
++		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
++
++		if (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_FOREIGN_TABLE)
++			return true;
++	}
++	return false;
++}
++
++/*
++ * find_candidate
++ *
++ * What it does: decides if a query can be rewritten into a semijoin.
++ *
++ * Inputs:  q - the query, as the planner receives it
++ *          c - filled in with everything we learn
++ * Output:  true only if ALL of these hold:
++ *   - it is a plain SELECT (no UNION/INTERSECT/EXCEPT, no FOR UPDATE, no
++ *     data-modifying WITH)
++ *   - FROM has exactly one local table and one postgres_fdw foreign table
++ *   - semijoin_filter = true for the foreign table (server or table) and
++ *     the server's "extensions" option lists sjbloom
++ *   - the sjbloom extension is installed here at site A
++ *   - only INNER joins, exactly one "local int4 = foreign int4" condition,
++ *     no other condition that uses both tables, no sjb_contains yet
++ *   - local conditions have no volatile functions, subqueries or params
++ *   If it returns false, c->reject_reason says why.
++ *
++ * Why it exists: the rewrite must only happen when it is certainly safe.
++ */
++static bool
++find_candidate(Query *q, SjbCandidate *c)
++{
++	memset(c, 0, sizeof(SjbCandidate));
++	c->uses_foreign_table = query_uses_foreign_table(q);
++
++	if (!c->uses_foreign_table)
++	{
++		c->reject_reason = "the query uses no foreign table";
++		return false;
++	}
++
++	if (q->commandType != CMD_SELECT || q->utilityStmt != NULL ||
++		q->setOperations != NULL || q->rowMarks != NIL || q->hasModifyingCTE)
++	{
++		c->reject_reason = "the query is not a plain SELECT";
++		return false;
++	}
++
++	if (!find_tables(q, c))
++		return false;
++
++	/* get_extension_oid(name, true) returns InvalidOid if it is missing */
++	c->sjbloom_oid = get_extension_oid("sjbloom", true);
++	if (!OidIsValid(c->sjbloom_oid))
++	{
++		c->reject_reason = "the sjbloom extension is not installed here";
++		return false;
++	}
++
++	if (!server_allows_semijoin(c))
++		return false;
++
++	if (!check_conditions(q, c))
++		return false;
++
++	return true;
++}
++
++
++
++/* ------------------------------------------------------------------------
++ * Step 2: statistics of the foreign table
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * get_reltuples
++ *
++ * What it does: reads pg_class.reltuples (the row count that ANALYZE
++ * stored) of a table.
++ *
++ * Inputs:  relid - the table's OID
++ * Output:  the row count; -1 if the table was never analyzed (or if it
++ *          cannot be found)
++ *
++ * Why it exists: we need |S| (and |R|) for the cost model.
++ */
++static double
++get_reltuples(Oid relid)
++{
++	HeapTuple	tuple;
++	double		reltuples;
++
++	/*
++	 * SearchSysCache1 looks up one catalog row through PostgreSQL's catalog
++	 * cache; RELOID = pg_class by OID. GETSTRUCT gives the row's fields as a
++	 * C struct. Every found row must be given back with ReleaseSysCache.
++	 */
++	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
++	if (!HeapTupleIsValid(tuple))
++		return -1;
++	reltuples = ((Form_pg_class) GETSTRUCT(tuple))->reltuples;
++	ReleaseSysCache(tuple);
++	return reltuples;
++}
++
++/*
++ * get_n_distinct
++ *
++ * What it does: reads the number of distinct values of one column from
++ * pg_statistic (stadistinct, shown as n_distinct in pg_stats).
++ *
++ * Inputs:  relid, attno - the table and the column
++ *          reltuples    - the table's row count
++ * Output:  the number of distinct values (at least 1); 0 if there are no
++ *          statistics
++ *
++ * Why it exists: stadistinct > 0 is a count, but stadistinct < 0 means
++ * "a fraction of the rows" (-0.5 = half of the rows are distinct), so it
++ * must be multiplied by the row count.
++ */
++static double
++get_n_distinct(Oid relid, AttrNumber attno, double reltuples)
++{
++	HeapTuple	tuple;
++	double		stadistinct;
++	double		n_distinct;
++
++	/* STATRELATTINH = pg_statistic by (table, column, inherited?) */
++	tuple = SearchSysCache3(STATRELATTINH,
++							ObjectIdGetDatum(relid),
++							Int16GetDatum(attno),
++							BoolGetDatum(false));
++	if (!HeapTupleIsValid(tuple))
++		return 0;
++	stadistinct = ((Form_pg_statistic) GETSTRUCT(tuple))->stadistinct;
++	ReleaseSysCache(tuple);
++
++	if (stadistinct > 0)
++		n_distinct = stadistinct;
++	else if (stadistinct < 0)
++		n_distinct = -stadistinct * reltuples;
++	else
++		return 0;				/* 0 means "unknown" */
++
++	if (n_distinct < 1)
++		n_distinct = 1;
++	return n_distinct;
++}
++
++/*
++ * column_text_width
++ *
++ * What it does: estimates how many bytes one value of a column takes as
++ * TEXT (postgres_fdw sends rows as text).
++ *
++ * Inputs:  relid, attno - the table and the column
++ * Output:  the width in bytes
++ *
++ * Why it exists: for int4, pg_stats says 4 (the stored width), but on the
++ * wire our ids are about 7 characters. For other types (text, ...) the
++ * stored average width from pg_stats is close to the text width.
++ */
++static double
++column_text_width(Oid relid, AttrNumber attno)
++{
++	Oid			type_id;
++	int32		typmod;
++	Oid			collation;
++	int32		width;
++
++	get_atttypetypmodcoll(relid, attno, &type_id, &typmod, &collation);
++	if (type_id == INT4OID)
++		return SJB_INT4_TEXT_WIDTH;
++
++	/* get_attavgwidth = pg_stats.avg_width (0 if there are no stats) */
++	width = get_attavgwidth(relid, attno);
++	if (width <= 0)
++		width = get_typavgwidth(type_id, typmod);	/* a guess by type */
++	return width;
++}
++
++/*
++ * foreign_columns_used
++ *
++ * What it does: returns the set of columns of the foreign table that the
++ * query uses: in the SELECT list, in the conditions, in GROUP BY and
++ * HAVING, plus the join column.
++ *
++ * Inputs:  q - the query; c - the candidate
++ * Output:  a Bitmapset of column numbers. pull_varattnos stores column
++ *          number attno as member (attno - FirstLowInvalidHeapAttributeNumber),
++ *          so that system columns (negative numbers) fit too.
++ *
++ * Why it exists: postgres_fdw fetches only these columns, so only they
++ * count in the width of a returned row.
++ */
++static Bitmapset *
++foreign_columns_used(Query *q, SjbCandidate *c)
++{
++	Bitmapset  *columns = NULL;
++	ListCell   *cell;
++
++	pull_varattnos((Node *) q->targetList, c->foreign_varno, &columns);
++	pull_varattnos((Node *) q->jointree, c->foreign_varno, &columns);
++	pull_varattnos(q->havingQual, c->foreign_varno, &columns);
++
++	/*
++	 * With GROUP BY, the SELECT list refers to the GROUP entry, and the
++	 * GROUP entry's groupexprs refer to the real columns.
++	 */
++	foreach(cell, q->rtable)
++	{
++		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
++
++		if (rte->rtekind == RTE_GROUP)
++			pull_varattnos((Node *) rte->groupexprs, c->foreign_varno, &columns);
++	}
++
++	columns = bms_add_member(columns,
++							 c->foreign_attno - FirstLowInvalidHeapAttributeNumber);
++	return columns;
++}
++
++/*
++ * get_fetch_size
++ *
++ * What it does: returns postgres_fdw's fetch_size for the foreign table
++ * (table option, else server option, else 100).
++ *
++ * Input:  c - the candidate
++ * Output: rows per FETCH
++ *
++ * Why it exists: the cost model counts one message per FETCH, so it must
++ * use the same fetch_size as postgres_fdw itself.
++ */
++static int
++get_fetch_size(SjbCandidate *c)
++{
++	ForeignTable *table = GetForeignTable(c->foreign_relid);
++	ForeignServer *server = GetForeignServer(table->serverid);
++	int			fetch_size = SJB_DEFAULT_FETCH_SIZE;
++	int			value;
++	ListCell   *cell;
++
++	/* server first, then the table (the table's value wins) */
++	foreach(cell, server->options)
++	{
++		DefElem    *def = (DefElem *) lfirst(cell);
++
++		/* parse_int reads an integer from text; false if it is not one */
++		if (strcmp(def->defname, "fetch_size") == 0 &&
++			parse_int(defGetString(def), &value, 0, NULL) && value > 0)
++			fetch_size = value;
++	}
++	foreach(cell, table->options)
++	{
++		DefElem    *def = (DefElem *) lfirst(cell);
++
++		if (strcmp(def->defname, "fetch_size") == 0 &&
++			parse_int(defGetString(def), &value, 0, NULL) && value > 0)
++			fetch_size = value;
++	}
++	return fetch_size;
++}
++
++/*
++ * collect_remote_stats
++ *
++ * What it does: fills in s_rows, d_remote, rows_per_key, row_width,
++ * num_columns and fetch_size.
++ *
++ * Inputs:  q - the query; c - the candidate; stats - to fill in
++ * Output:  true if all statistics are there; false (with
++ *          c->reject_reason) if not
++ *
++ * Why it exists: the cost model needs these numbers. They come from site
++ * A's own statistics of the foreign table (ANALYZE customers at site_a
++ * fetches a sample from site B), so no network call is needed here.
++ */
++static bool
++collect_remote_stats(Query *q, SjbCandidate *c, SjbStats *stats)
++{
++	Bitmapset  *columns;
++	int			member;
++	double		text_width = 0;
++
++	stats->s_rows = get_reltuples(c->foreign_relid);
++	if (stats->s_rows < 0)
++	{
++		/* psprintf = sprintf into newly allocated memory (palloc) */
++		c->reject_reason = psprintf("the foreign table has no statistics: run ANALYZE %s at site_a",
++									get_rel_name(c->foreign_relid));
++		c->always_report = true;
++		return false;
++	}
++	if (stats->s_rows == 0)
++	{
++		c->reject_reason = "the foreign table is empty";
++		return false;
++	}
++
++	stats->d_remote = get_n_distinct(c->foreign_relid, c->foreign_attno, stats->s_rows);
++	if (stats->d_remote <= 0)
++	{
++		c->reject_reason = psprintf("the foreign join column has no statistics: run ANALYZE %s at site_a",
++									get_rel_name(c->foreign_relid));
++		c->always_report = true;
++		return false;
++	}
++	stats->rows_per_key = stats->s_rows / stats->d_remote;
++
++	/* width on the wire: text widths + 7 + 4 * number of columns */
++	columns = foreign_columns_used(q, c);
++	stats->num_columns = 0;
++	member = -1;
++	while ((member = bms_next_member(columns, member)) >= 0)
++	{
++		AttrNumber	attno = member + FirstLowInvalidHeapAttributeNumber;
++
++		if (attno <= 0)
++		{
++			c->reject_reason = "the query uses a system column or a whole-row reference of the foreign table";
++			return false;
++		}
++		text_width += column_text_width(c->foreign_relid, attno);
++		stats->num_columns++;
++	}
++	stats->row_width = text_width + SJB_ROW_OVERHEAD_BYTES +
++		SJB_COLUMN_OVERHEAD_BYTES * stats->num_columns;
++
++	stats->fetch_size = get_fetch_size(c);
++	return true;
++}
++
++
++/* ------------------------------------------------------------------------
++ * Step 3: the sub-SELECT on the local table, and the estimate of n
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * local_key_text
++ *
++ * What it does: returns the SQL text of the local join key, for example
++ * o.customer_id (quoted if needed).
++ * Input:  c - the candidate
++ * Output: a new string
++ * Why it exists: the three sub-SELECTs all need it.
++ */
++static char *
++local_key_text(SjbCandidate *c)
++{
++	/* quote_identifier adds "..." only when a name needs it */
++	return psprintf("%s.%s",
++					quote_identifier(c->local_alias),
++					quote_identifier(get_attname(c->local_relid, c->local_attno, false)));
++}
++
++/*
++ * build_local_select
++ *
++ * What it does: writes the SQL text
++ *     SELECT <select_list> FROM [ONLY] schema.table alias
++ *     WHERE alias.key IS NOT NULL AND (<local condition 1>) AND ...
++ *
++ * Inputs:  c           - the candidate (local table and its conditions)
++ *          select_list - the SELECT list text, e.g. "o.customer_id"
++ * Output:  the SQL text
++ *
++ * Why it exists: the estimate (step 3) and both rewrites (step 5) read
++ * the same local rows R'. "key IS NOT NULL" is added because a NULL key
++ * never joins.
++ */
++static char *
++build_local_select(SjbCandidate *c, const char *select_list)
++{
++	StringInfoData sql;
++	List	   *deparse_context;
++	char	   *alias = (char *) quote_identifier(c->local_alias);
++	char	   *table_name;
++	ListCell   *cell;
++
++	table_name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(c->local_relid)),
++											get_rel_name(c->local_relid));
++
++	/* A StringInfo is a growing string; appendStringInfo works like printf. */
++	initStringInfo(&sql);
++	appendStringInfo(&sql, "SELECT %s FROM %s%s %s WHERE %s IS NOT NULL",
++					 select_list,
++					 c->local_inh ? "" : "ONLY ",
++					 table_name,
++					 alias,
++					 local_key_text(c));
++
++	/*
++	 * Turn each local condition back into SQL text. In the new query the
++	 * local table is range table entry number 1, so first we copy the
++	 * condition (copyObject) and renumber its Vars to 1 (ChangeVarNodes).
++	 * deparse_expression then prints it, using "alias." before columns.
++	 */
++	deparse_context = deparse_context_for(c->local_alias, c->local_relid);
++	foreach(cell, c->local_quals)
++	{
++		Node	   *qual = copyObject((Node *) lfirst(cell));
++
++		ChangeVarNodes(qual, c->local_varno, 1, 0);
++		appendStringInfo(&sql, " AND (%s)",
++						 deparse_expression(qual, deparse_context, true, false));
++	}
++	return sql.data;
++}
++
++/*
++ * parse_select
++ *
++ * What it does: turns SQL text into an analysed Query tree, exactly like
++ * PostgreSQL does for a query typed by a user.
++ *
++ * Input:  sql - one SELECT statement
++ * Output: the Query
++ *
++ * Why it exists: writing SQL text and parsing it is much simpler (and
++ * easier to read) than building a Query tree by hand.
++ */
++static Query *
++parse_select(const char *sql)
++{
++	List	   *raw_statements;
++
++	/* raw_parser: text -> syntax tree (one RawStmt per statement) */
++	raw_statements = raw_parser(sql, RAW_PARSE_DEFAULT);
++	if (list_length(raw_statements) != 1)
++		elog(ERROR, "semijoin: expected one statement in: %s", sql);
++
++	/* parse analysis: looks up tables, columns, functions and types */
++	return parse_analyze_fixedparams(linitial_node(RawStmt, raw_statements),
++									 sql, NULL, 0, NULL);
++}
++
++/*
++ * estimate_local_keys
++ *
++ * What it does: estimates n, the number of distinct non-NULL join keys of
++ * the local rows R'.
++ *   1. r = the planner's row estimate for
++ *          SELECT key FROM local WHERE key IS NOT NULL AND <local conditions>
++ *   2. D_local = number of distinct keys in the whole local table
++ *   3. Cardenas' formula (A. F. Cardenas, "Analysis and Performance of
++ *      Inverted Data Base Structures", CACM 18(5), 1975): if r rows are
++ *      picked at random from a table with D distinct values, the expected
++ *      number of distinct values among them is
++ *          n = D * (1 - (1 - 1/D)^r)
++ *      (each value is missed by one row with probability 1 - 1/D, so by
++ *      all r rows with probability (1 - 1/D)^r).
++ *
++ * Inputs:  c - the candidate; stats - r_local, d_local, n_est are set
++ * Output:  none
++ *
++ * Why it exists: the real n is only known when the query runs, but the
++ * path must be chosen now, at plan time.
++ */
++static void
++estimate_local_keys(SjbCandidate *c, SjbStats *stats)
++{
++	char	   *sql = build_local_select(c, local_key_text(c));
++	Query	   *query = parse_select(sql);
++	PlannedStmt *plan;
++
++	/*
++	 * We call standard_planner directly, not planner(): planner() would
++	 * call our hook again.
++	 */
++	plan = standard_planner(query, sql, 0, NULL);
++	stats->r_local = plan->planTree->plan_rows;
++
++	stats->d_local = get_n_distinct(c->local_relid, c->local_attno,
++									get_reltuples(c->local_relid));
++	if (stats->d_local <= 0)
++	{
++		/* no statistics: assume every row has its own key */
++		stats->n_est = stats->r_local;
++		return;
++	}
++	stats->n_est = stats->d_local *
++		(1.0 - pow(1.0 - 1.0 / stats->d_local, stats->r_local));
++}
++
++
++/* ------------------------------------------------------------------------
++ * Step 4: index path or filter path?
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * call_cost_function
++ *
++ * What it does: calls one of sjbloom's SQL functions sjb_plan_choice or
++ * sjb_choice_report (they take the same 11 arguments, see
++ * sjbloom--1.0.sql) directly through fmgr, PostgreSQL's function call
++ * interface, and returns the text result.
++ *
++ * Inputs:  c             - the candidate (sjbloom's schema)
++ *          function_name - "sjb_plan_choice" or "sjb_choice_report"
++ *          stats         - the estimates (n = stats->n_est)
++ * Output:  the result text, or NULL if the function does not exist
++ *
++ * Why it exists: the cost model lives in ONE place (sjbloom's
++ * costmodel.c). We call it without SPI (no SQL query is run).
++ */
++static char *
++call_cost_function(SjbCandidate *c, const char *function_name, SjbStats *stats)
++{
++	Oid			argument_types[11];
++	Oid			function_oid;
++	FmgrInfo	function_info;
++	Datum		result;
++	int			i;
++
++	/* LOCAL_FCINFO declares a FunctionCallInfo with room for 11 arguments */
++	LOCAL_FCINFO(fcinfo, 11);
++
++	for (i = 0; i < 10; i++)
++		argument_types[i] = FLOAT8OID;
++	argument_types[10] = INT4OID;	/* fetch_size */
++
++	/* LookupFuncName finds a function by (schema, name) and argument types */
++	function_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
++											 makeString(pstrdup(function_name))),
++								  11, argument_types, true);
++	if (!OidIsValid(function_oid))
++		return NULL;
++
++	/* fmgr_info prepares the call; then we put the 11 arguments in place */
++	fmgr_info(function_oid, &function_info);
++	InitFunctionCallInfoData(*fcinfo, &function_info, 11, InvalidOid, NULL, NULL);
++
++	/* Float8GetDatum / Int32GetDatum wrap a C value as a Datum */
++	fcinfo->args[0].value = Float8GetDatum(stats->n_est);
++	fcinfo->args[1].value = Float8GetDatum(stats->s_rows);
++	fcinfo->args[2].value = Float8GetDatum(stats->rows_per_key);
++	fcinfo->args[3].value = Float8GetDatum(stats->row_width);
++	fcinfo->args[4].value = Float8GetDatum(pgfdw_semijoin_network_mbit);
++	fcinfo->args[5].value = Float8GetDatum(pgfdw_semijoin_t_check_ns);
++	fcinfo->args[6].value = Float8GetDatum(pgfdw_semijoin_t_lookup_us);
++	fcinfo->args[7].value = Float8GetDatum(pgfdw_semijoin_per_message_ms);
++	fcinfo->args[8].value = Float8GetDatum(pgfdw_semijoin_per_row_us);
++	fcinfo->args[9].value = Float8GetDatum(pgfdw_semijoin_t_build_us);
++	fcinfo->args[10].value = Int32GetDatum(stats->fetch_size);
++	for (i = 0; i < 11; i++)
++		fcinfo->args[i].isnull = false;
++
++	result = FunctionCallInvoke(fcinfo);
++	if (fcinfo->isnull)
++		return NULL;
++	return text_to_cstring(DatumGetTextPP(result));
++}
++
++/*
++ * decide_path
++ *
++ * What it does: chooses SEMIJOIN_PATH_INDEX or SEMIJOIN_PATH_FILTER.
++ *
++ * Inputs:  c - the candidate; stats - the estimates
++ * Output:  the path, or -1 (with c->reject_reason) if the cost model
++ *          could not be called
++ *
++ * Why it exists: postgres_fdw.semijoin_force_path (for tests and demos)
++ * wins; otherwise sjbloom's cost model decides.
++ */
++static int
++decide_path(SjbCandidate *c, SjbStats *stats)
++{
++	char	   *choice;
++
++	if (pgfdw_semijoin_force_path == SEMIJOIN_PATH_INDEX ||
++		pgfdw_semijoin_force_path == SEMIJOIN_PATH_FILTER)
++		return pgfdw_semijoin_force_path;
++
++	choice = call_cost_function(c, "sjb_plan_choice", stats);
++	if (choice != NULL && strcmp(choice, "index") == 0)
++		return SEMIJOIN_PATH_INDEX;
++	if (choice != NULL && strcmp(choice, "filter") == 0)
++		return SEMIJOIN_PATH_FILTER;
++
++	c->reject_reason = "sjb_plan_choice could not be called (is sjbloom up to date?)";
++	return -1;
++}
++
++
++/* ------------------------------------------------------------------------
++ * Step 5: the new condition
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * make_expr_sublink
++ *
++ * What it does: wraps a Query as a scalar sub-SELECT "(SELECT ...)".
++ * Input:  subquery - the Query
++ * Output: a SubLink node of type EXPR_SUBLINK
++ * Why it exists: an EXPR_SUBLINK returns one value. Because it does not
++ * use any column of the outer query, the planner runs it only ONCE, as
++ * an "InitPlan", and postgres_fdw sends its value to site B as $1.
++ */
++static Node *
++make_expr_sublink(Query *subquery)
++{
++	/* makeNode allocates a new node (palloc) and sets its type tag */
++	SubLink    *sublink = makeNode(SubLink);
++
++	sublink->subLinkType = EXPR_SUBLINK;
++	sublink->subLinkId = 0;
++	sublink->testexpr = NULL;
++	sublink->operName = NIL;
++	sublink->subselect = (Node *) subquery;
++	sublink->location = -1;
++	return (Node *) sublink;
++}
++
++/*
++ * build_index_condition
++ *
++ * What it does: builds
++ *     foreign.key = ANY ((SELECT array_agg(DISTINCT o.key) FROM local o
++ *                         WHERE ...))
++ * as a ScalarArrayOpExpr (the node for "x = ANY (array)").
++ *
++ * Inputs:  c   - the candidate
++ *          sql - set to the text of the sub-SELECT (for the NOTICE)
++ * Output:  the condition
++ *
++ * Why it exists: on this path site B can use its index on the key.
++ */
++static Node *
++build_index_condition(SjbCandidate *c, char **sql)
++{
++	ScalarArrayOpExpr *any_expr = makeNode(ScalarArrayOpExpr);
++	Node	   *sublink;
++
++	*sql = build_local_select(c, psprintf("array_agg(DISTINCT %s)", local_key_text(c)));
++	sublink = make_expr_sublink(parse_select(*sql));
++
++	any_expr->opno = Int4EqualOperator;
++	any_expr->opfuncid = get_opcode(Int4EqualOperator);	/* int4eq */
++	any_expr->hashfuncid = InvalidOid;
++	any_expr->negfuncid = InvalidOid;
++	any_expr->useOr = true;		/* ANY (true for at least one element) */
++	any_expr->inputcollid = InvalidOid;
++	any_expr->args = list_make2(copyObject(c->foreign_var), sublink);
++	any_expr->location = -1;
++	return (Node *) any_expr;
++}
++
++/*
++ * build_filter_condition
++ *
++ * What it does: builds
++ *     sjb_contains((SELECT sjb_build_auto(array_agg(o.key), <s_rows>,
++ *                   <rows_per_key>, <row_width>, <network_mbit>,
++ *                   <t_check_ns>, <max_filter_bytes>, 2, <per_message_ms>,
++ *                   <per_row_us>, <t_build_us>, <fetch_size>)
++ *                   FROM local o WHERE ...),
++ *                  foreign.key)
++ *
++ * Inputs:  c     - the candidate
++ *          stats - the estimates (printed into the SQL text)
++ *          sql   - set to the text of the sub-SELECT (for the NOTICE)
++ * Output:  the condition, or NULL if sjb_contains cannot be found
++ *
++ * Why it exists: on this path site B scans S and keeps only rows whose
++ * key passes the filter. sjb_build_auto picks BLOOM, EXACT or PASS when
++ * the query runs, from the exact number of keys. array_agg has no
++ * DISTINCT: sjb_build_auto sorts and removes duplicates itself.
++ */
++static Node *
++build_filter_condition(SjbCandidate *c, SjbStats *stats, char **sql)
++{
++	Oid			contains_argument_types[2] = {BYTEAOID, INT4OID};
++	Oid			contains_oid;
++	long long	max_filter_bytes = (long long) pgfdw_semijoin_max_filter_kb * 1024;
++	char	   *build_call;
++	Node	   *sublink;
++
++	contains_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
++											 makeString("sjb_contains")),
++								  2, contains_argument_types, true);
++	if (!OidIsValid(contains_oid))
++	{
++		c->reject_reason = "function sjb_contains(bytea, int4) not found";
++		return NULL;
++	}
++
++	/* %.17g prints a double with all its digits, so nothing is rounded */
++	build_call = psprintf("%s.sjb_build_auto(array_agg(%s), "
++						  "%.17g::float8, %.17g::float8, %.17g::float8, "
++						  "%.17g::float8, %.17g::float8, %lld::int8, "
++						  "%.17g::float8, %.17g::float8, %.17g::float8, "
++						  "%.17g::float8, %d::int4)",
++						  quote_identifier(c->sjbloom_schema),
++						  local_key_text(c),
++						  stats->s_rows,
++						  stats->rows_per_key,
++						  stats->row_width,
++						  pgfdw_semijoin_network_mbit,
++						  pgfdw_semijoin_t_check_ns,
++						  max_filter_bytes,
++						  SJB_WIRE_FACTOR,
++						  pgfdw_semijoin_per_message_ms,
++						  pgfdw_semijoin_per_row_us,
++						  pgfdw_semijoin_t_build_us,
++						  stats->fetch_size);
++	*sql = build_local_select(c, build_call);
++	sublink = make_expr_sublink(parse_select(*sql));
++
++	/* makeFuncExpr builds a function call node: sjb_contains(...) -> bool */
++	return (Node *) makeFuncExpr(contains_oid, BOOLOID,
++								 list_make2(sublink, copyObject(c->foreign_var)),
++								 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
++}
++
++/*
++ * report_decision
++ *
++ * What it does: prints the verbose NOTICE: the estimates, the two
++ * predicted times (the "winner:" line of sjb_choice_report) and the path.
++ *
++ * Inputs:  c, stats - the candidate and estimates; path - the chosen path;
++ *          sql - the sub-SELECT text
++ * Output:  none (a NOTICE)
++ * Why it exists: postgres_fdw.semijoin_verbose = on explains every
++ * decision.
++ */
++static void
++report_decision(SjbCandidate *c, SjbStats *stats, int path, const char *sql)
++{
++	char	   *report = call_cost_function(c, "sjb_choice_report", stats);
++	char	   *winner_line = NULL;
++
++	if (report != NULL)
++		winner_line = strstr(report, "winner:");
++
++	ereport(NOTICE,
++			(errmsg("postgres_fdw semijoin: %s path (%s): n_est=%.1f (r=%.0f, D_local=%.0f), s_rows=%.0f, rows_per_key=%.3f, row_width=%.2f (%d columns), fetch_size=%d",
++					path == SEMIJOIN_PATH_INDEX ? "index" : "filter",
++					pgfdw_semijoin_force_path == SEMIJOIN_PATH_AUTO ? "cost model" : "forced",
++					stats->n_est, stats->r_local, stats->d_local,
++					stats->s_rows, stats->rows_per_key, stats->row_width,
++					stats->num_columns, stats->fetch_size),
++			 errdetail("cost model %s\nsub-SELECT: %s",
++					   winner_line != NULL ? winner_line : "report not available",
++					   sql)));
++}
++
++/*
++ * plan_semijoin
++ *
++ * What it does: steps 2 to 5 for a candidate: statistics, estimate of n,
++ * the decision, and the new condition.
++ *
++ * Inputs:  q - the query; c - the candidate
++ * Output:  the new condition to add to WHERE, or NULL (with
++ *          c->reject_reason) if the query should stay unchanged
++ *
++ * Why it exists: it keeps all the work in one place, so that the caller
++ * can run it "protected" (see try_plan_semijoin).
++ */
++static Node *
++plan_semijoin(Query *q, SjbCandidate *c)
++{
++	SjbStats	stats;
++	int			path;
++	Node	   *condition;
++	char	   *sql = NULL;
++
++	memset(&stats, 0, sizeof(stats));
++	c->sjbloom_schema = get_namespace_name(get_extension_schema(c->sjbloom_oid));
++	if (c->sjbloom_schema == NULL)
++	{
++		c->reject_reason = "the schema of sjbloom was not found";
++		return NULL;
++	}
++
++	if (!collect_remote_stats(q, c, &stats))
++		return NULL;
++	estimate_local_keys(c, &stats);
++
++	path = decide_path(c, &stats);
++	if (path == SEMIJOIN_PATH_INDEX)
++		condition = build_index_condition(c, &sql);
++	else if (path == SEMIJOIN_PATH_FILTER)
++		condition = build_filter_condition(c, &stats, &sql);
++	else
++		return NULL;
++
++	if (condition != NULL && pgfdw_semijoin_verbose)
++		report_decision(c, &stats, path, sql);
++	return condition;
++}
++
++/*
++ * try_plan_semijoin
++ *
++ * What it does: runs plan_semijoin inside a "subtransaction". If any
++ * error happens inside, it is caught, the subtransaction is rolled back
++ * (this undoes locks and frees resources), and NULL is returned.
++ *
++ * Inputs:  q - the query; c - the candidate
++ * Output:  the new condition, or NULL
++ *
++ * Why it exists: our feature must never make a user's query fail. In
++ * PostgreSQL an error can only be caught safely together with a
++ * subtransaction (PL/pgSQL's EXCEPTION blocks work the same way).
++ * A query cancel (Ctrl-C) is not our error, so it is passed on.
++ */
++static Node *
++try_plan_semijoin(Query *q, SjbCandidate *c)
++{
++	MemoryContext old_context = CurrentMemoryContext;
++	ResourceOwner old_owner = CurrentResourceOwner;
++	Node	   *condition = NULL;
++
++	/* subtransactions are not allowed in parallel mode: do nothing */
++	if (IsInParallelMode())
++	{
++		c->reject_reason = "planning in parallel mode";
++		return NULL;
++	}
++
++	/*
++	 * BeginInternalSubTransaction switches to the subtransaction's memory;
++	 * we switch back, so that the new condition survives the end of the
++	 * subtransaction.
++	 */
++	BeginInternalSubTransaction(NULL);
++	MemoryContextSwitchTo(old_context);
++
++	PG_TRY();
++	{
++		condition = plan_semijoin(q, c);
++
++		/* success: end the subtransaction, keeping its work */
++		ReleaseCurrentSubTransaction();
++		MemoryContextSwitchTo(old_context);
++		CurrentResourceOwner = old_owner;
++	}
++	PG_CATCH();
++	{
++		ErrorData  *error;
++
++		/* save the error, then clear it and roll back */
++		MemoryContextSwitchTo(old_context);
++		error = CopyErrorData();
++		FlushErrorState();
++		RollbackAndReleaseCurrentSubTransaction();
++		MemoryContextSwitchTo(old_context);
++		CurrentResourceOwner = old_owner;
++
++		if (error->sqlerrcode == ERRCODE_QUERY_CANCELED)
++			ReThrowError(error);
++
++		condition = NULL;
++		c->reject_reason = psprintf("internal problem, query left unchanged: %s",
++									error->message);
++		c->always_report = true;
++		FreeErrorData(error);
++	}
++	PG_END_TRY();
++
++	return condition;
++}
++
++/*
++ * pgfdw_semijoin_planner
++ *
++ * What it does: our planner hook. PostgreSQL calls it for every query it
++ * plans. If the semijoin feature is on and the query is a candidate, it
++ * adds the new condition to the query's WHERE (steps 2-5). Then it ALWAYS
++ * lets the normal planner plan the (maybe changed) query.
++ *
++ * Inputs:  the same as standard_planner (see planner_hook_type in
++ *          src/include/optimizer/planner.h)
++ * Output:  the finished plan
++ *
++ * Why it exists: a planner hook is the place where we can change a query
++ * before PostgreSQL plans it.
++ */
++PlannedStmt *
++pgfdw_semijoin_planner(Query *parse, const char *query_string,
++					   int cursorOptions, ParamListInfo boundParams)
++{
++	if (pgfdw_enable_semijoin && !in_semijoin_hook)
++	{
++		SjbCandidate candidate;
++		Node	   *condition = NULL;
++
++		/*
++		 * PG_TRY / PG_FINALLY: if an error happens inside, the FINALLY part
++		 * still runs (and then the error continues). This makes sure the
++		 * flag is reset even after an error.
++		 */
++		in_semijoin_hook = true;
++		PG_TRY();
++		{
++			if (find_candidate(parse, &candidate))
++				condition = try_plan_semijoin(parse, &candidate);
++
++			if (condition != NULL)
++			{
++				/*
++				 * The only change to the user's query: "AND <condition>" in
++				 * WHERE. make_and_qual(a, b) builds "a AND b" (or just b if
++				 * there was no WHERE).
++				 */
++				parse->jointree->quals = make_and_qual(parse->jointree->quals,
++													   condition);
++				parse->hasSubLinks = true;
++			}
++			else if (candidate.uses_foreign_table &&
++					 (pgfdw_semijoin_verbose || candidate.always_report))
++				ereport(NOTICE,
++						(errmsg("postgres_fdw semijoin: no rewrite: %s",
++								candidate.reject_reason)));
++		}
++		PG_FINALLY();
++		{
++			in_semijoin_hook = false;
++		}
++		PG_END_TRY();
++	}
++
++	if (prev_planner_hook != NULL)
++		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
++	return standard_planner(parse, query_string, cursorOptions, boundParams);
++}
