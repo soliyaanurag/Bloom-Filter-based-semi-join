@@ -12,12 +12,20 @@
  *                ALL rows of S. The filter has one of three MODES:
  *                BLOOM, EXACT or PASS (see sjb_filter.h).
  *
- * For each path and mode we estimate the TIME the query costs:
+ * For each path and mode we estimate the TIME the query costs, with the
+ * total-time formula of Ozsu & Valduriez ("Principles of Distributed
+ * Database Systems", chapter on query optimization, cost functions):
  *
- *   time = bytes moved over the network / bandwidth  +  work at site B
+ *   time = T_CPU * work  +  T_MSG * messages  +  T_TR * bytes
  *
- * (communication cost + local processing cost, as in Ozsu & Valduriez,
- * "Principles of Distributed Database Systems"). The cheapest one wins.
+ *   T_CPU * work     work at site B (checking rows or index lookups),
+ *                    work at site A (building the filter), and the work
+ *                    per returned row (text out at B, text in at A)
+ *   T_MSG * messages one cost per message round trip: postgres_fdw sends
+ *                    the query, then fetches fetch_size rows per FETCH
+ *   T_TR * bytes     bytes moved / bandwidth
+ *
+ * The cheapest one wins.
  *
  * costmodel.c only does arithmetic on doubles. It knows nothing about SQL
  * values; sjbloom.c turns SQL arguments into an SjbCostInputs and calls it.
@@ -60,6 +68,10 @@ typedef struct SjbCostInputs
 	double		max_filter_bytes;	/* largest BLOOM/EXACT filter allowed */
 	double		wire_factor;	/* wire bytes per filter byte (2 = hex) */
 	double		key_text_len;	/* bytes per key in the key list text */
+	double		per_message_ms;	/* T_MSG: ms per message round trip */
+	double		per_row_us;		/* us per returned row (text out + in) */
+	double		t_build_us;		/* site A: us per key to build a filter */
+	double		fetch_size;		/* rows per postgres_fdw FETCH (100) */
 } SjbCostInputs;
 
 /*
@@ -80,8 +92,12 @@ typedef struct SjbCostEstimate
 	double		rows_back;		/* rows site B sends back */
 	double		bytes_b_to_a;	/* rows_back * row_width */
 	double		network_seconds;	/* (bytes_a_to_b + bytes_b_to_a) / bandwidth */
+	double		messages;		/* 1 + ceil(rows_back / fetch_size) */
+	double		message_seconds;	/* messages * per_message_ms */
+	double		row_seconds;	/* rows_back * per_row_us */
+	double		work_at_a_seconds;	/* building the filter at site A */
 	double		work_at_b_seconds;	/* checks or index lookups at site B */
-	double		total_seconds;	/* network_seconds + work_at_b_seconds */
+	double		total_seconds;	/* the sum of the five times above */
 } SjbCostEstimate;
 
 /* The estimates for all four ways, and the two decisions. */
@@ -108,6 +124,11 @@ extern double sjb_exact_filter_bytes(double n, double wire_factor);
 extern double sjb_pass_filter_bytes(double wire_factor);
 extern double sjb_key_list_bytes(double n, double key_text_len);
 extern double sjb_bandwidth_bytes_per_sec(double network_mbit);
+extern double sjb_message_count(double rows_back, double fetch_size);
+extern double sjb_message_seconds(double messages, double per_message_ms);
+extern double sjb_returned_row_seconds(double rows_back, double per_row_us);
+extern double sjb_index_lookup_seconds(double n, double t_lookup_us);
+extern double sjb_filter_build_seconds(double n, double t_build_us);
 
 /* The whole model: fills in all four estimates and both decisions. */
 extern void sjb_estimate_all(const SjbCostInputs *inputs, SjbChoice *choice);

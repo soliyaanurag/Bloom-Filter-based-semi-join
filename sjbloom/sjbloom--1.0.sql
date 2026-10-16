@@ -108,6 +108,15 @@ $$;
  *   t_check_ns       site B's time to scan + check one row (calibrated)
  *   max_filter_bytes BLOOM or EXACT filters bigger than this are not built
  *   wire_factor      wire bytes per filter byte (2: hex text)
+ *   per_message_ms   cost of one message round trip A <-> B   (Batch 5b)
+ *   per_row_us       CPU cost of one returned row (text out at B, text
+ *                    in at A)                                 (Batch 5b)
+ *   t_build_us       site A's time per key to build a filter  (Batch 5b)
+ *   fetch_size       rows per postgres_fdw FETCH (postgres_fdw default 100)
+ *
+ * The defaults of per_message_ms, per_row_us and t_build_us are the
+ * values bench/calibrate.py measured on OUR machine
+ * (results/calibration.json); pass your own values after calibrating.
  *
  * All settings are ARGUMENTS, never read from configuration settings, so
  * the function really is IMMUTABLE: the same inputs always give the same
@@ -120,7 +129,11 @@ CREATE FUNCTION sjb_build_auto(keys int4[],
                                network_mbit float8,
                                t_check_ns float8,
                                max_filter_bytes int8 DEFAULT 1048576,
-                               wire_factor float8 DEFAULT 2)
+                               wire_factor float8 DEFAULT 2,
+                               per_message_ms float8 DEFAULT 0.06194,
+                               per_row_us float8 DEFAULT 0.54819,
+                               t_build_us float8 DEFAULT 0.245,
+                               fetch_size int4 DEFAULT 100)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'sjb_build_auto'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -132,9 +145,17 @@ LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  * it shows bytes A->B, rows back, bytes B->A, network time, work at B and
  * total time, then the winner. It runs the same C code as sjb_build_auto.
  *
- * n is the number of distinct keys. t_lookup_us is site B's time for one
- * index lookup (calibrated). max_filter_bytes and wire_factor are the
- * defaults of sjb_build_auto (1 MB and 2).
+ * The total time of each line is (Ozsu & Valduriez):
+ *   T_TR * bytes      bytes / bandwidth
+ * + T_MSG * messages  (1 + ceil(rows back / fetch_size)) * per_message_ms
+ * + T_CPU * work      rows back * per_row_us
+ *                     + index path: n * t_lookup_us
+ *                     + filter path: s_rows * t_check_ns + n * t_build_us
+ *
+ * n is the number of distinct keys. t_lookup_us is the index path's time
+ * per key (calibrated end to end through postgres_fdw). The last four
+ * arguments are as for sjb_build_auto. max_filter_bytes and wire_factor
+ * are the defaults of sjb_build_auto (1 MB and 2).
  */
 CREATE FUNCTION sjb_choice_report(n float8,
                                   s_rows float8,
@@ -142,7 +163,11 @@ CREATE FUNCTION sjb_choice_report(n float8,
                                   row_width float8,
                                   network_mbit float8,
                                   t_check_ns float8,
-                                  t_lookup_us float8)
+                                  t_lookup_us float8,
+                                  per_message_ms float8 DEFAULT 0.06194,
+                                  per_row_us float8 DEFAULT 0.54819,
+                                  t_build_us float8 DEFAULT 0.245,
+                                  fetch_size int4 DEFAULT 100)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_choice_report'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -158,7 +183,11 @@ CREATE FUNCTION sjb_plan_choice(n float8,
                                 row_width float8,
                                 network_mbit float8,
                                 t_check_ns float8,
-                                t_lookup_us float8)
+                                t_lookup_us float8,
+                                per_message_ms float8 DEFAULT 0.06194,
+                                per_row_us float8 DEFAULT 0.54819,
+                                t_build_us float8 DEFAULT 0.245,
+                                fetch_size int4 DEFAULT 100)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_plan_choice'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

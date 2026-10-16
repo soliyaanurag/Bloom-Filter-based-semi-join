@@ -793,3 +793,188 @@ psql -X -d site_a -f queries/choice_demo.sql         # the four reports
 ```
 
 To use your own calibrated values in the SQL files: `psql -X -d site_a -v t_check_ns=150 -v t_lookup_us=1.5 -f queries/choice_demo.sql`. `DROP EXTENSION ... CASCADE` does not remove the `extensions 'sjbloom'` option of the foreign server; that is only text, so `enable_sjbloom.sql` does not need to be run again.
+
+## Batch 5b: the complete Özsu–Valduriez cost model
+
+Batch 5's validation showed that the model missed a cost for every returned row and part of the index path's work. In Batch 5b the model gets the full total-time formula of Özsu & Valduriez (*Principles of Distributed Database Systems*, chapter on query optimization, cost functions):
+
+```
+time = T_CPU * #instructions  +  T_MSG * #messages  +  T_TR * #bytes
+```
+
+In plain words, a distributed query costs three kinds of time. Computers do **work** (T_CPU). Every **message** sent between the sites has a fixed cost no matter how small it is (T_MSG). Every **byte** has to travel over the network (T_TR = 1 / bandwidth). (The book's I/O term is part of our CPU work, because our tables are cached in memory.) For our two paths:
+
+| term | index path | filter path (each mode) |
+|---|---|---|
+| T_TR · bytes | (key list + M rows) / bandwidth | (filter + rows back) / bandwidth |
+| T_MSG · messages | (1 + ceil(M / fetch_size)) · per_message_ms | (1 + ceil(rows back / fetch_size)) · per_message_ms |
+| T_CPU · returned rows | M · per_row_us | rows back · per_row_us |
+| T_CPU · work at B | n · t_lookup_us | s_rows · t_check_ns |
+| T_CPU · work at A | — | n · t_build_us |
+
+### The new constants, in plain words
+
+- **per_message_ms**: the cost of one round trip between site A and site B. postgres_fdw sends the query, then asks for rows with `FETCH 100`, waits for them, asks again, and so on: 1 + ceil(rows / fetch_size) messages. Each round trip has a fixed cost (system calls, waking up the other process, protocol messages) however many rows it carries. **0.062 ms** on our machine.
+- **per_row_us**: the CPU cost of one returned row on top of finding it. Site B turns the row into text and site A turns the text back into values and builds a tuple. **0.55 µs**.
+- **t_lookup_us**: the index path's cost per key, measured end to end through postgres_fdw: the key list turned into text at A, parsed and planned at B, and the index lookup itself. The message and row costs are measured separately and taken out. **4.80 µs** (in Batch 5 we measured only the index lookup inside B: 1.65 µs).
+- **t_build_us**: site A's cost per key to build the filter with `sjb_build_auto` (sort, remove repeats, hash or copy). Only the filter path pays it. **0.245 µs**.
+- **fetch_size**: rows per FETCH. Not measured: it is read from the foreign table's or server's options, and postgres_fdw's default is 100.
+- **t_check_ns** is unchanged in how it is measured (a full scan with sjb_contains in site_b). This run gave **158.19 ns**; earlier runs gave 150–188.
+
+### Files
+
+**`sjbloom/costmodel.h`, `costmodel.c`**: `SjbCostInputs` has four new fields (per_message_ms, per_row_us, t_build_us, fetch_size), and `SjbCostEstimate` has messages, message_seconds, row_seconds and work_at_a_seconds. New formula functions, each commented with its source: `sjb_message_count` (1 + ceil(rows / fetch_size)), `sjb_message_seconds`, `sjb_returned_row_seconds`, `sjb_index_lookup_seconds`, `sjb_filter_build_seconds`. `finish_estimate` now adds all five parts. `set_filter_path_work` sets the work at B and at A for the three filter modes.
+
+**`sjbloom/sjbloom.c`, `sjbloom--1.0.sql`**: `sjb_build_auto`, `sjb_choice_report` and `sjb_plan_choice` have four new arguments at the end: `per_message_ms`, `per_row_us`, `t_build_us` (defaults = our calibrated values 0.06194, 0.54819, 0.245) and `fetch_size int4 DEFAULT 100`. They are still arguments, not GUCs, so the functions stay IMMUTABLE. Old calls keep working, because the new arguments have defaults. The report has new columns: messages, messages_ms, rows_ms and work_A_ms.
+
+**`sjbloom/sql/sjbloom_basic.sql`**: Steps 9–16 now pass the new arguments explicitly as 0 (and fetch_size 100), so they still test the bytes-only choices and do not change when the calibrated defaults change. All their results are unchanged. Step 15 shows the wider report, Step 17 tests `fetch_size = 0`, and the new Step 19 shows that a cost per returned row turns BLOOM into EXACT: at 10 µs per row, Bloom's ~85 false positives cost more than its smaller filter saves.
+
+**`bench/calibrate.py`**: three new measurements, each on its own workload: ranges of customer_ids and random existing keys from a fixed seed, never the benchmark queries or the orders keys. Parallel workers are off at both sites.
+
+**`bench/common.py`**: `fetch_size(conn)` reads fetch_size from the foreign table or server options (default 100). `initplan_ms(plan)` adds up the InitPlan times.
+
+**`bench/validate_model.py`**: uses all the calibrated constants, and reads the report by its header line (so new columns do not break it).
+
+**`bench/strategies.py`**: `auto_filter(...)`, the filter path as the system really runs it: `sjb_contains(sjb_build_auto(array_agg(customer_id), ...), c.customer_id)`.
+
+**`bench/break_even.py`** (new): the break-even n, predicted and measured.
+
+**`queries/choice_demo.sql`**: new Step 5 finds the break-even n with `sjb_plan_choice`.
+
+### How each constant is measured (`bench/calibrate.py`)
+
+**per_message_ms and per_row_us.** `SELECT customer_id, name FROM customers WHERE customer_id <= R` for R = 1000, 10000, 100000, 300000, 1000000:
+- `fdw_ms`: the Foreign Scan node's time at site_a.
+- `local_ms`: the same query in site_b, run as `EXPLAIN ANALYZE DECLARE ... CURSOR FOR ...`, so B uses the same cursor plan postgres_fdw gets.
+- `extra_ms = fdw_ms − local_ms` is what postgres_fdw adds on top of B's own work. We fit `extra_ms = per_message_ms · messages + per_row_us · R` with plain least squares (`fit_two_terms`, two normal equations solved with Cramer's rule).
+
+The first try used only fetch_size 100, and it **failed**. With one fetch size, messages = 1 + R/100 is just R divided by 100, so the two terms grow together, and least squares cannot tell which one the time belongs to:
+
+| run | per_message_ms | per_row_us | R² |
+|---|---:|---:|---:|
+| 1 | −82.7 | 829 | 0.981 |
+| 2 | 8.8 | −86.7 | 0.9997 |
+
+Both runs fit the data (high R²) with meaningless, even negative, constants. The only thing they agreed on was the combined cost per row, about 1.1–2.0 µs. The fix: run the same R values with **fetch_size 100, 1000 and 10000**, on a throwaway foreign table `calib_tmp.customers` (same remote table; dropped at the end, even on error), so the same R comes with very different numbers of messages:
+
+```
+fetch_size |         R | messages |   fdw_ms | local_ms | extra_ms |   fit_ms | local_plan
+       100 |     1,000 |       11 |     2.14 |     0.30 |     1.84 |     1.23 | Index Scan
+       100 |    10,000 |      101 |    13.53 |     2.57 |    10.96 |    11.74 | Index Scan
+       100 |   100,000 |    1,001 |   141.05 |    26.02 |   115.03 |   116.82 | Index Scan
+       100 |   300,000 |    3,001 |   433.15 |    74.66 |   358.49 |   350.33 | Index Scan
+       100 | 1,000,000 |   10,001 | 1,403.06 |   234.63 | 1,168.43 | 1,167.64 |   Seq Scan
+     1,000 |     1,000 |        2 |     1.18 |     0.30 |     0.88 |     0.67 | Index Scan
+     1,000 |    10,000 |       11 |     8.97 |     2.57 |     6.40 |     6.16 | Index Scan
+     1,000 |   100,000 |      101 |    79.66 |    26.02 |    53.63 |    61.08 | Index Scan
+     1,000 |   300,000 |      301 |   252.21 |    74.66 |   177.55 |   183.10 | Index Scan
+     1,000 | 1,000,000 |    1,001 |   813.67 |   234.63 |   579.04 |   610.19 |   Seq Scan
+    10,000 |     1,000 |        2 |     1.14 |     0.30 |     0.84 |     0.67 | Index Scan
+    10,000 |    10,000 |        2 |     7.69 |     2.57 |     5.12 |     5.61 | Index Scan
+    10,000 |   100,000 |       11 |    74.22 |    26.02 |    48.20 |    55.50 | Index Scan
+    10,000 |   300,000 |       31 |   239.93 |    74.66 |   165.27 |   166.38 | Index Scan
+    10,000 | 1,000,000 |      101 |   820.65 |   234.63 |   586.01 |   554.44 |   Seq Scan
+fit: extra_ms = 0.06194 ms * messages + 0.54819 us * rows, R^2 = 0.99858
+```
+
+The model still uses the **real** fetch_size (100) when it predicts. At fetch_size 100 the two constants add up to 0.062/100 ms + 0.55 µs ≈ 1.17 µs per row, inside the range the failed fits agreed on.
+
+**t_lookup_us.** Through postgres_fdw, `SELECT customer_id, name FROM customers WHERE customer_id = ANY ((SELECT keys)::int4[])` for n = 1000, 5000, 20000, 50000 random existing keys. The sub-SELECT makes postgres_fdw send the keys as a parameter (`Remote SQL: ... WHERE ((customer_id = ANY ($1::integer[])))`), like the benchmark. From the Foreign Scan time we subtract messages · per_message_ms and n · per_row_us, then fit a straight line:
+
+```
+     n | fdw_ms | messages | message_ms | row_ms | per_key_work_ms
+ 1,000 |   6.61 |       11 |       0.68 |   0.55 |            5.38
+ 5,000 |  29.35 |       51 |       3.16 |   2.74 |           23.45
+20,000 |  80.80 |      201 |      12.45 |  10.96 |           57.38
+50,000 | 299.56 |      501 |      31.03 |  27.41 |          241.12
+fitted line: per_key_work_ms = -9.284 + n * 0.004796  ->  t_lookup_us = 4.7956, R^2 = 0.968
+```
+
+The points are not on a straight line: the work per key is about 5 µs at 1000, 2.9 µs at 20000 and 4.8 µs at 50000. B's own plan stays an Index Scan for every n. B's own time per key also jumps at 50000 (38 ms for 20000 keys, 158 ms for 50000), probably because 50,000 random rows touch more table pages than stay in shared_buffers. The fitted slope is an average over this range.
+
+**t_build_us.** At site_a, `SELECT sjb_build_auto((SELECT keys), ...)` for n = 1000, 10000, 50000, 150000 random existing keys. The keys are passed through a sub-SELECT: with a constant array, PostgreSQL would compute the IMMUTABLE function once while *planning*, and the execution time would be 0. The cost model's inputs are realistic (customers statistics + the constants measured just before), so it builds the mode the real filter path would build:
+
+```
+      n | median_ms |  mode
+  1,000 |      0.11 | exact
+ 10,000 |      2.50 | bloom
+ 50,000 |     13.98 | bloom
+150,000 |     36.74 | bloom
+fitted line: time_ms = 0.411 + n * 0.000245  ->  t_build_us = 0.245, R^2 = 0.997
+```
+
+All of it is saved in `results/calibration.json`: every point, every fitted line with its R², and a `"suggested"` block:
+
+```json
+"suggested": {
+  "t_check_ns": 158.19, "t_lookup_us": 4.7956, "per_message_ms": 0.06194,
+  "per_row_us": 0.54819, "t_build_us": 0.245, "fetch_size": 100
+}
+```
+
+The site B measurements with and without parallel workers are still there. This time the parallel-allowed runs were slower (Bloom 231 vs 158 ms) with the **same** serial plan, so that difference is noise. `count(*)` still goes parallel (144 → 69 ms).
+
+### Validation (`bench/validate_model.py`)
+
+The comparison is now against the **parts the model covers**: the Foreign Scan node's time. The batch asked for "Foreign Scan time plus InitPlan time", but the InitPlan (which builds the key list or filter) already runs **inside** the Foreign Scan's time. postgres_fdw computes the parameter when it opens the remote cursor. We checked this with a `pg_sleep` in the InitPlan: the InitPlan took 1108 ms, and the Foreign Scan's first row came at 1114 ms. Adding the InitPlan again would count it twice, so it is printed as its own column. End to end (planning + whole query) is printed for reference. The constants were not changed to fit these numbers.
+
+```
+     n | n_keys |                  strategy | predicted_ms | covered_ms | ratio | initplan_ms | end_to_end_ms | e2e_ratio | pred_rows | remote_rows
+   100 |    100 | exact_keys (nestloop off) |         0.69 |       1.09 |  1.58 |        0.08 |          1.72 |      2.49 |       100 |         100
+   100 |    100 |   bloom_dynamic (b=27.73) |       158.49 |     152.53 |  0.96 |        0.08 |        153.40 |      0.97 |       102 |         109
+ 1,000 |    999 | exact_keys (nestloop off) |         6.33 |       6.23 |  0.98 |        0.47 |          7.49 |      1.18 |       999 |         999
+ 1,000 |    999 |   bloom_dynamic (b=22.93) |       160.04 |     151.60 |  0.95 |        0.64 |        153.03 |      0.96 |     1,015 |       1,016
+10,000 |  9,955 | exact_keys (nestloop off) |        62.54 |      52.91 |  0.85 |        4.76 |         62.29 |      1.00 |     9,955 |       9,955
+10,000 |  9,955 |   bloom_dynamic (b=18.13) |       175.49 |     202.76 |  1.16 |        7.04 |        212.10 |      1.21 |    10,119 |      10,108
+50,000 | 48,738 | exact_keys (nestloop off) |       305.85 |     311.52 |  1.02 |       26.11 |        346.97 |      1.13 |    48,738 |      48,738
+50,000 | 48,738 |   bloom_dynamic (b=14.74) |       242.10 |     311.17 |  1.29 |       32.12 |        359.93 |      1.49 |    49,537 |      49,480
+```
+
+Two more runs gave ratios of 0.76–1.08 for exact_keys (n ≥ 1000), 0.89–1.08 for Bloom at n ≤ 1000, 1.16–1.32 at n = 10000 and 1.19–1.29 at n = 50000.
+
+Compared with Batch 5 (index path ≈ 3× too optimistic, Bloom up to 1.65), the model now predicts the **index path** well. The 1.58 at n = 100 is only 0.4 ms. The **filter path at larger n** is still 20–30% too optimistic, for these reasons:
+- **The InitPlan does more than the model counts.** bloom_dynamic's InitPlan scans orders and sorts the keys twice (`array_agg(DISTINCT)` and `count(DISTINCT)`): 32 ms at n = 50000, while the model counts only `sjb_build_auto`'s 12 ms. The index path's InitPlan (26 ms, scanning orders and building the key list) is not in the model either; its ratio near 1 at n = 50000 is within the run-to-run noise, so we cannot tell from these runs what absorbs it.
+- **t_check_ns depends a little on the filter size.** A larger filter fits worse in the CPU cache: we measured 160–168 ns for 3–90 KB filters and 184 ns for a 223 KB one, against the calibrated 158 ns.
+- **t_check_ns itself varies by ±15% between runs** (150–188 ns), which is ±25 ms on 1,000,000 rows. That is the same size as the remaining gap.
+
+We do not tune t_check_ns to this. A larger, averaged calibration of t_check_ns (several filter sizes, more runs) would be the honest fix.
+
+### Break-even: from how many keys is the filter path faster?
+
+`queries/choice_demo.sql` Step 5 and `bench/break_even.py`. Predicted = the smallest n for which `sjb_plan_choice` says `filter` (steps of 500; the choice switches only once on both networks). Measured = exact_keys (nestloop off) against the real filter path (`auto_filter`, `sjb_build_auto`, which built BLOOM at every point) for 10,000–200,000 orders, with the crossing found by a straight line between the two points around it. 1 Mbit/s cannot be measured on localhost (that needs sudo to slow down the network), so it is **simulated**: measured time + measured bytes / 125,000 bytes per second.
+
+| network | predicted | measured (Foreign Scan) | measured (end to end) |
+|---|---:|---:|---:|
+| 1000 Mbit/s | 35,000 keys | 65,263 keys | 74,772 keys |
+| 1 Mbit/s (simulated) | 8,500 keys | 11,837 keys | 11,964 keys |
+
+```
+1000 Mbit/s:  n_keys | pred_index | pred_filter | index_covered | filter_covered
+               9,955 |      62.54 |      175.49 |         44.57 |         231.65
+              48,738 |     305.85 |      242.10 |        270.05 |         303.42
+              72,226 |     453.21 |      282.38 |        348.23 |         334.17
+             139,294 |     873.91 |      397.14 |        585.29 |         456.59
+             181,329 |   1,137.66 |      469.02 |        848.30 |         556.21
+```
+
+- **1 Mbit/s:** the bytes dominate, and the model is close (8,500 vs about 11,800 keys).
+- **1000 Mbit/s:** the CPU terms decide, and the model now switches to the filter path **too early** (35,000 vs about 65,000). Two errors push the same way. The filter path is predicted 20–30% too low (see above). And the straight t_lookup line, fitted on 1,000–50,000 keys where the last step is steep, overestimates the index path beyond 50,000 keys (1138 ms predicted vs 848 ms at 181,329 keys).
+- **Compared with Batch 5:** the old model put the break-even near 110,000 keys against about 60,000 measured, so it erred the other way and by a similar factor. Now the network term is right, and the error comes from the fact that CPU time per key and per row is not a single constant on this machine.
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom && make -C sjbloom install
+for db in site_a site_b; do psql -d $db -c "DROP EXTENSION sjbloom CASCADE" -c "CREATE EXTENSION sjbloom"; done
+make -C sjbloom installcheck                       # 1 test, ok
+.venv/bin/python bench/calibrate.py                # about 50 s, writes results/calibration.json
+.venv/bin/python bench/validate_model.py           # about 5 s
+.venv/bin/python bench/break_even.py               # about 30 s
+psql -X -d site_a -f queries/choice_demo.sql       # four reports + break-even
+psql -X -d site_a -f queries/auto_manual.sql       # correctness, all counts 0
+```
+
+After calibrating on another machine, pass your values to the functions (the last four arguments), or change the defaults in `sjbloom--1.0.sql` and recreate the extension.
+
+Side effect worth knowing: with the new costs, `auto_manual.sql` at n = 100 now builds **EXACT** instead of BLOOM. Bloom's ~2 false positives make 102 rows back, which needs a third FETCH round trip (0.062 ms). That costs more than the 108 bytes Bloom saves (about 1 µs at 1000 Mbit/s). At n = 10000 and 150000 it still builds BLOOM.

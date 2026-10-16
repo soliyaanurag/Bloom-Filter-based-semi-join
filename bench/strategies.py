@@ -138,6 +138,29 @@ def bloom_dynamic(n, b, width):
     return bloom_manual(n, b, width)
 
 
+def auto_filter(n, width, s_rows, rows_per_key, row_width, network_mbit, t_check_ns):
+    """
+    The filter path as the system really runs it (Batch 5): the join with
+    "sjb_contains(sjb_build_auto(keys, ...), c.customer_id)". sjb_build_auto
+    picks the mode (BLOOM, EXACT or PASS) and the Bloom size. The message,
+    row and build costs use the function's defaults (our calibrated
+    values). No DISTINCT is needed: sjb_build_auto removes repeated keys.
+
+    Input:  n; width; s_rows, rows_per_key, row_width (on the wire),
+            network_mbit, t_check_ns: the cost model's inputs.
+    Output: (sql_text, bytes_a_to_b_sql, filter_sql). filter_sql is the
+            sub-SELECT that builds the filter, so the caller can also ask
+            which mode was built.
+    """
+    filter_sql = (f"(SELECT sjb_build_auto(array_agg(customer_id), {float(s_rows)}, "
+                  f"{float(rows_per_key)}, {float(row_width)}, {float(network_mbit)}, "
+                  f"{float(t_check_ns)}) "
+                  f"FROM orders WHERE order_id <= {int(n)})")
+    sql_text = join_sql(n, width, f"AND sjb_contains({filter_sql}, c.customer_id)")
+    bytes_sql = f"SELECT octet_length({filter_sql}::text)"
+    return sql_text, bytes_sql, filter_sql
+
+
 def distinct_keys(conn, n):
     """
     Number of distinct customer_ids among the kept orders (the keys that go

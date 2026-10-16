@@ -14,20 +14,27 @@
  *                      M rows back
  *   filter path PASS   header only A->B, |S| checks at B, all |S| rows back
  *
- *   time = (bytes A->B + bytes B->A) / bandwidth  +  work at site B
+ *   time = T_CPU * work  +  T_MSG * messages  +  T_TR * bytes
  *
- * (communication cost + local processing cost; Ozsu & Valduriez,
- * "Principles of Distributed Database Systems").
+ * the total-time formula of Ozsu & Valduriez, "Principles of Distributed
+ * Database Systems" (chapter on query optimization, cost functions).
+ * Our terms:
+ *   T_TR * bytes      (bytes A->B + bytes B->A) / bandwidth
+ *   T_MSG * messages  messages * per_message_ms
+ *   T_CPU * work      rows_back * per_row_us          (returned rows)
+ *                     + n * t_lookup_us               (index path, at B)
+ *                     + s_rows * t_check_ns           (filter path, at B)
+ *                     + n * t_build_us                (filter path, at A)
+ * The constants are measured by bench/calibrate.py.
  *
  * Every function here is plain arithmetic on doubles: no SQL values, no
  * memory allocation. sjbloom.c calls sjb_estimate_all, and Batch 6's
  * planner hook will call it too, so all decisions are made in ONE place.
  *
- * What the model does NOT contain (on purpose, for now): work at site A
- * (scanning orders, building the filter, the final hash join) and a cost
- * per returned row (turning rows into text and back, postgres_fdw's
- * fetches of 100 rows at a time). bench/validate_model.py measures how
- * much these missing parts matter.
+ * What the model does NOT contain: the rest of site A's work (scanning
+ * orders, collecting the keys, the final join) and planning time. They
+ * are the same for both paths or do not depend on the path choice.
+ * bench/validate_model.py compares the model with measured times.
  *
  *-------------------------------------------------------------------------
  */
@@ -253,6 +260,104 @@ sjb_bandwidth_bytes_per_sec(double network_mbit)
 }
 
 /*
+ * sjb_message_count
+ *
+ * What it does: the number of message round trips between site A and
+ * site B for one remote query:
+ *   messages = 1 + ceil(rows_back / fetch_size)
+ * postgres_fdw first sends the query (opening a cursor), then fetches the
+ * rows fetch_size at a time (default 100), one round trip per FETCH.
+ * Source: the T_MSG * #messages term of Ozsu & Valduriez; the message
+ * pattern is postgres_fdw's (contrib/postgres_fdw, fetch_more_data).
+ *
+ * Inputs:  rows_back  - rows site B sends back
+ *          fetch_size - rows per FETCH (at least 1)
+ * Output:  the number of messages
+ * Why it exists: many returned rows also mean many round trips.
+ */
+double
+sjb_message_count(double rows_back, double fetch_size)
+{
+	return 1.0 + ceil(rows_back / fetch_size);
+}
+
+/*
+ * sjb_message_seconds
+ *
+ * What it does: the time spent on messages:
+ *   messages * per_message_ms * 1e-3      (ms -> seconds)
+ * Source: T_MSG * #messages (Ozsu & Valduriez). per_message_ms is
+ * measured by bench/calibrate.py.
+ * Inputs:  messages, per_message_ms
+ * Output:  seconds
+ * Why it exists: one part of the total time.
+ */
+double
+sjb_message_seconds(double messages, double per_message_ms)
+{
+	return messages * per_message_ms * 1e-3;
+}
+
+/*
+ * sjb_returned_row_seconds
+ *
+ * What it does: the CPU time per returned row, for all rows:
+ *   rows_back * per_row_us * 1e-6      (us -> seconds)
+ * Site B turns every returned row into text, and site A turns the text
+ * back into values and builds a tuple. This work does not depend on the
+ * network speed.
+ * Source: a T_CPU * #instructions term of Ozsu & Valduriez, measured per
+ * row by bench/calibrate.py.
+ * Inputs:  rows_back, per_row_us
+ * Output:  seconds
+ * Why it exists: validation in Batch 5 showed 2-4 us per returned row
+ * that the bytes / bandwidth term alone did not explain.
+ */
+double
+sjb_returned_row_seconds(double rows_back, double per_row_us)
+{
+	return rows_back * per_row_us * 1e-6;
+}
+
+/*
+ * sjb_index_lookup_seconds
+ *
+ * What it does: the index path's work per key:
+ *   n * t_lookup_us * 1e-6      (us -> seconds)
+ * t_lookup_us is measured END TO END through postgres_fdw (key list to
+ * text at A, parsing and planning at B, the index lookup), with the
+ * message and per-row costs taken out.
+ * Source: a T_CPU * #instructions term of Ozsu & Valduriez.
+ * Inputs:  n, t_lookup_us
+ * Output:  seconds
+ * Why it exists: the work of the index path.
+ */
+double
+sjb_index_lookup_seconds(double n, double t_lookup_us)
+{
+	return n * t_lookup_us * 1e-6;
+}
+
+/*
+ * sjb_filter_build_seconds
+ *
+ * What it does: the filter path's extra work at site A, building the
+ * filter from n keys (sort, remove repeats, hash or copy the keys):
+ *   n * t_build_us * 1e-6      (us -> seconds)
+ * Source: a T_CPU * #instructions term of Ozsu & Valduriez, measured per
+ * key by bench/calibrate.py (timing sjb_build_auto at site A).
+ * Inputs:  n, t_build_us
+ * Output:  seconds
+ * Why it exists: the index path does not build a filter, so this is a
+ * real difference between the two paths.
+ */
+double
+sjb_filter_build_seconds(double n, double t_build_us)
+{
+	return n * t_build_us * 1e-6;
+}
+
+/*
  * start_estimate
  *
  * What it does: sets every field of an estimate to 0, gives it a name and
@@ -289,11 +394,14 @@ skip_estimate(SjbCostEstimate *estimate, const char *reason)
 /*
  * finish_estimate
  *
- * What it does: given bytes_a_to_b, rows_back and work_at_b_seconds,
- * fills in the rest:
+ * What it does: given bytes_a_to_b, rows_back, work_at_a_seconds and
+ * work_at_b_seconds, fills in the rest:
  *   bytes_b_to_a    = rows_back * row_width
- *   network_seconds = (bytes_a_to_b + bytes_b_to_a) / bandwidth
- *   total_seconds   = network_seconds + work_at_b_seconds
+ *   network_seconds = (bytes_a_to_b + bytes_b_to_a) / bandwidth   (T_TR)
+ *   messages        = 1 + ceil(rows_back / fetch_size)
+ *   message_seconds = messages * per_message_ms                  (T_MSG)
+ *   row_seconds     = rows_back * per_row_us                     (T_CPU)
+ *   total_seconds   = network + messages + rows + work at A + work at B
  * Inputs:  inputs, estimate
  * Output:  none (fills *estimate)
  * Why it exists: the last steps are the same for all four estimates.
@@ -305,23 +413,33 @@ finish_estimate(const SjbCostInputs *inputs, SjbCostEstimate *estimate)
 
 	estimate->bytes_b_to_a = estimate->rows_back * inputs->row_width;
 	estimate->network_seconds = (estimate->bytes_a_to_b + estimate->bytes_b_to_a) / bandwidth;
-	estimate->total_seconds = estimate->network_seconds + estimate->work_at_b_seconds;
+	estimate->messages = sjb_message_count(estimate->rows_back, inputs->fetch_size);
+	estimate->message_seconds = sjb_message_seconds(estimate->messages, inputs->per_message_ms);
+	estimate->row_seconds = sjb_returned_row_seconds(estimate->rows_back, inputs->per_row_us);
+	estimate->total_seconds = estimate->network_seconds
+		+ estimate->message_seconds
+		+ estimate->row_seconds
+		+ estimate->work_at_a_seconds
+		+ estimate->work_at_b_seconds;
 }
 
 /*
- * filter_path_work_seconds
+ * set_filter_path_work
  *
- * What it does: work at site B in the filter path. B must scan ALL rows
- * of S and call sjb_contains on each one (it cannot use its index):
- *   s_rows * t_check_ns * 1e-9   (ns -> seconds)
- * Input:   inputs
- * Output:  seconds
- * Why it exists: the same for all three filter modes.
+ * What it does: sets the work of the filter path, the same for all three
+ * filter modes:
+ *   at site B: scan ALL rows of S and call sjb_contains on each one (it
+ *              cannot use its index): s_rows * t_check_ns * 1e-9
+ *   at site A: build the filter from the n keys: n * t_build_us * 1e-6
+ * Inputs:  inputs, estimate
+ * Output:  none (fills work_at_a_seconds and work_at_b_seconds)
+ * Why it exists: all three filter modes need the same two lines.
  */
-static double
-filter_path_work_seconds(const SjbCostInputs *inputs)
+static void
+set_filter_path_work(const SjbCostInputs *inputs, SjbCostEstimate *estimate)
 {
-	return inputs->s_rows * inputs->t_check_ns * 1e-9;
+	estimate->work_at_b_seconds = inputs->s_rows * inputs->t_check_ns * 1e-9;
+	estimate->work_at_a_seconds = sjb_filter_build_seconds(inputs->num_keys, inputs->t_build_us);
 }
 
 /*
@@ -329,6 +447,7 @@ filter_path_work_seconds(const SjbCostInputs *inputs)
  *
  * What it does: the index path. A sends the key list as text; B does one
  * index lookup per key (n * t_lookup_us); the M matching rows come back.
+ * There is no filter to build at site A.
  * Inputs:  inputs, matching_rows (M)
  * Output:  none (fills *estimate)
  * Why it exists: the planner (Batch 6) compares it with the filter path.
@@ -340,7 +459,8 @@ estimate_index_path(const SjbCostInputs *inputs, double matching_rows,
 	start_estimate(estimate, "index");
 	estimate->bytes_a_to_b = sjb_key_list_bytes(inputs->num_keys, inputs->key_text_len);
 	estimate->rows_back = matching_rows;
-	estimate->work_at_b_seconds = inputs->num_keys * inputs->t_lookup_us * 1e-6;
+	estimate->work_at_b_seconds = sjb_index_lookup_seconds(inputs->num_keys, inputs->t_lookup_us);
+	estimate->work_at_a_seconds = 0.0;	/* no filter to build */
 	finish_estimate(inputs, estimate);
 }
 
@@ -390,7 +510,7 @@ estimate_bloom(const SjbCostInputs *inputs, double matching_rows,
 	estimate->fp_rate = sjb_fp_rate(inputs->num_keys, estimate->m, estimate->k);
 	estimate->bytes_a_to_b = sjb_bloom_filter_bytes(estimate->m, inputs->wire_factor);
 	estimate->rows_back = matching_rows + non_matching_rows * estimate->fp_rate;
-	estimate->work_at_b_seconds = filter_path_work_seconds(inputs);
+	set_filter_path_work(inputs, estimate);
 	finish_estimate(inputs, estimate);
 }
 
@@ -418,7 +538,7 @@ estimate_exact(const SjbCostInputs *inputs, double matching_rows,
 
 	estimate->bytes_a_to_b = sjb_exact_filter_bytes(inputs->num_keys, inputs->wire_factor);
 	estimate->rows_back = matching_rows;
-	estimate->work_at_b_seconds = filter_path_work_seconds(inputs);
+	set_filter_path_work(inputs, estimate);
 	finish_estimate(inputs, estimate);
 }
 
@@ -440,7 +560,7 @@ estimate_pass(const SjbCostInputs *inputs, SjbCostEstimate *estimate)
 	estimate->filter_size = sizeof(SjbHeader);
 	estimate->bytes_a_to_b = sjb_pass_filter_bytes(inputs->wire_factor);
 	estimate->rows_back = inputs->s_rows;
-	estimate->work_at_b_seconds = filter_path_work_seconds(inputs);
+	set_filter_path_work(inputs, estimate);
 	finish_estimate(inputs, estimate);
 }
 

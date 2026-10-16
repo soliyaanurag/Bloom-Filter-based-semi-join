@@ -145,6 +145,30 @@ def remote_rows(node):
     return round(node["Actual Rows"] * node["Actual Loops"])
 
 
+def initplan_ms(plan):
+    """
+    Total time of the InitPlans in a plan (sub-SELECTs that run once, for
+    example the one that builds the filter or the key list). In JSON
+    EXPLAIN they are nodes with "Parent Relationship": "InitPlan".
+
+    Note: when an InitPlan's result is a parameter of the Foreign Scan,
+    postgres_fdw computes it while opening the remote cursor, so this time
+    is ALSO inside the Foreign Scan's time.
+
+    Input:  plan, the dict returned by explain_json.
+    Output: the time in ms (0 if there is no InitPlan).
+    """
+    total = 0.0
+    nodes_to_visit = [plan["Plan"]]
+    while nodes_to_visit:
+        node = nodes_to_visit.pop(0)
+        if node.get("Parent Relationship") == "InitPlan":
+            total = total + node["Actual Total Time"] * node["Actual Loops"]
+        for child in node.get("Plans", []):
+            nodes_to_visit.append(child)
+    return total
+
+
 def total_time_ms(plan):
     """
     Total time of the query at site A, in milliseconds: planning time plus
@@ -189,6 +213,35 @@ def avg_row_width(width="narrow"):
     row = conn.execute("SELECT avg(" + width_expression + ") FROM customers").fetchone()
     conn.close()
     return float(row[0])
+
+
+def fetch_size(conn):
+    """
+    How many rows postgres_fdw fetches from site B per FETCH round trip.
+
+    It can be set as an option of the foreign table (wins) or of the
+    foreign server; if neither is set, postgres_fdw uses 100.
+    pg_options_to_table turns an options array like {fetch_size=500} into
+    (option_name, option_value) rows.
+
+    Input:  conn, a connection to site_a.
+    Output: the fetch size, as an int.
+    """
+    sql = """
+        SELECT coalesce(
+            (SELECT option_value
+             FROM pg_foreign_table t, pg_options_to_table(t.ftoptions)
+             WHERE t.ftrelid = 'public.customers'::regclass
+               AND option_name = 'fetch_size'),
+            (SELECT option_value
+             FROM pg_foreign_table t
+             JOIN pg_foreign_server s ON s.oid = t.ftserver,
+                  pg_options_to_table(s.srvoptions)
+             WHERE t.ftrelid = 'public.customers'::regclass
+               AND option_name = 'fetch_size'),
+            '100')::int
+    """
+    return conn.execute(sql).fetchone()[0]
 
 
 def check_correct(conn, baseline_sql, new_sql):

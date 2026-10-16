@@ -28,7 +28,7 @@
 \endif
 \if :{?t_check_ns}
 \else
-    \set t_check_ns 182.62
+    \set t_check_ns 158.19
 \endif
 
 -- Step 2: statistics of customers from site_a's catalog

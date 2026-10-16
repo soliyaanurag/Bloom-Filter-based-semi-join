@@ -12,8 +12,9 @@
 | `plot.py` | draws the PNG charts in `results/` |
 | `run_all.sh` | runs the three scripts above in order |
 | `time_contains.py` | times site B's full scan with `sjb_contains` (median of 5), to compare two builds of the C code |
-| `calibrate.py` | Batch 5: measures site B's `t_check_ns` and `t_lookup_us` (parallel workers off, and once on for comparison), writes `results/calibration.json` |
-| `validate_model.py` | Batch 5: predicted time (`sjb_choice_report`) vs measured time for exact_keys and bloom_dynamic, narrow rows |
+| `calibrate.py` | Batch 5/5b: measures `t_check_ns`, `per_message_ms`, `per_row_us`, `t_lookup_us` and `t_build_us` on separate calibration workloads (parallel workers off), writes `results/calibration.json` with the fitted lines and R^2 |
+| `validate_model.py` | Batch 5/5b: predicted time (`sjb_choice_report`) vs measured Foreign Scan time (and end-to-end) for exact_keys and bloom_dynamic, narrow rows |
+| `break_even.py` | Batch 5b: the n where the filter path beats the index path, predicted vs measured, at 1000 Mbit/s and (simulated) 1 Mbit/s |
 | `capture_bytes.sh` | prints (does not run) tcpdump/capinfos commands for a packet-capture cross-check |
 
 Rerun everything: `source setup/env.example.sh && bench/run_all.sh`. See docs/WALKTHROUGH.md, Batch 4.

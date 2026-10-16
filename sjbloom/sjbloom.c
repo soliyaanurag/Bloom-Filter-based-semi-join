@@ -8,7 +8,9 @@
  *       Site A: build a Bloom filter with a given size.
  *   sjb_build_auto(keys int4[], s_rows, rows_per_key, row_width,
  *                  network_mbit, t_check_ns,
- *                  max_filter_bytes, wire_factor) RETURNS bytea
+ *                  max_filter_bytes, wire_factor,
+ *                  per_message_ms, per_row_us, t_build_us,
+ *                  fetch_size) RETURNS bytea
  *       Site A: let the cost model pick the mode (BLOOM, EXACT or PASS)
  *       and the Bloom size, then build that filter.            (Batch 5)
  *   sjb_contains(filter bytea, key int4) RETURNS bool
@@ -16,7 +18,8 @@
  *   sjb_info(filter bytea) RETURNS text
  *       Debugging: describe a filter in one line of text.
  *   sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
- *                     t_check_ns, t_lookup_us) RETURNS text
+ *                     t_check_ns, t_lookup_us, per_message_ms,
+ *                     per_row_us, t_build_us, fetch_size) RETURNS text
  *       A readable report of the cost model's estimates.       (Batch 5)
  *   sjb_plan_choice(same arguments) RETURNS text
  *       'index' or 'filter': which path the cost model picks.  (Batch 5)
@@ -649,15 +652,20 @@ check_cost_inputs(const SjbCostInputs *inputs)
 	check_cost_argument("t_lookup_us", inputs->t_lookup_us, true);
 	check_cost_argument("max_filter_bytes", inputs->max_filter_bytes, true);
 	check_cost_argument("wire_factor", inputs->wire_factor, false);
+	check_cost_argument("per_message_ms", inputs->per_message_ms, true);
+	check_cost_argument("per_row_us", inputs->per_row_us, true);
+	check_cost_argument("t_build_us", inputs->t_build_us, true);
+	check_cost_argument("fetch_size", inputs->fetch_size, false);
 }
 
 /*
  * read_report_arguments
  *
- * What it does: reads the 7 arguments of sjb_choice_report and
+ * What it does: reads the 11 arguments of sjb_choice_report and
  * sjb_plan_choice (n, s_rows, rows_per_key, row_width, network_mbit,
- * t_check_ns, t_lookup_us) into an SjbCostInputs, uses the default
- * max_filter_bytes, wire_factor and key text length, and checks them.
+ * t_check_ns, t_lookup_us, per_message_ms, per_row_us, t_build_us,
+ * fetch_size) into an SjbCostInputs, uses the default max_filter_bytes,
+ * wire_factor and key text length, and checks them.
  *
  * Inputs:  fcinfo - the function call info of the SQL function (it holds
  *                   the arguments; the PG_GETARG_ macros read from it)
@@ -677,6 +685,10 @@ read_report_arguments(FunctionCallInfo fcinfo, SjbCostInputs *inputs)
 	inputs->network_mbit = PG_GETARG_FLOAT8(4);
 	inputs->t_check_ns = PG_GETARG_FLOAT8(5);
 	inputs->t_lookup_us = PG_GETARG_FLOAT8(6);
+	inputs->per_message_ms = PG_GETARG_FLOAT8(7);
+	inputs->per_row_us = PG_GETARG_FLOAT8(8);
+	inputs->t_build_us = PG_GETARG_FLOAT8(9);
+	inputs->fetch_size = PG_GETARG_INT32(10);
 	inputs->max_filter_bytes = SJB_DEFAULT_MAX_FILTER_BYTES;
 	inputs->wire_factor = SJB_DEFAULT_WIRE_FACTOR;
 	inputs->key_text_len = SJB_DEFAULT_KEY_TEXT_LEN;
@@ -706,8 +718,10 @@ mode_name(int mode)
  * append_estimate_line
  *
  * What it does: appends one line of the report table for one estimate:
- * path, mode, bits/key, bytes A->B, rows back, bytes B->A, network ms,
- * work at B ms, total ms. A skipped mode gets "skipped: <reason>" instead.
+ * path, mode, bits/key, bytes A->B, rows back, bytes B->A, messages, then
+ * the times in ms: network (bytes / bandwidth), messages, returned rows,
+ * work at A, work at B and the total. A skipped mode gets
+ * "skipped: <reason>" instead.
  *
  * Inputs:  report   - the text being built
  *          path     - "index" or "filter"
@@ -737,12 +751,16 @@ append_estimate_line(StringInfo report, const char *path,
 	if (estimate->bits_per_key > 0)
 		bits_column = psprintf("%.2f", estimate->bits_per_key);
 
-	appendStringInfo(report, "%-7s %-6s %8s %12.0f %10.0f %12.0f %11.3f %12.3f %11.3f\n",
+	appendStringInfo(report, "%-7s %-6s %8s %12.0f %10.0f %12.0f %8.0f %11.3f %11.3f %9.3f %10.3f %10.3f %11.3f\n",
 					 path, mode_column, bits_column,
 					 estimate->bytes_a_to_b,
 					 estimate->rows_back,
 					 estimate->bytes_b_to_a,
+					 estimate->messages,
 					 estimate->network_seconds * 1000.0,
+					 estimate->message_seconds * 1000.0,
+					 estimate->row_seconds * 1000.0,
+					 estimate->work_at_a_seconds * 1000.0,
 					 estimate->work_at_b_seconds * 1000.0,
 					 estimate->total_seconds * 1000.0);
 }
@@ -819,7 +837,9 @@ PG_FUNCTION_INFO_V1(sjb_build_auto);
 /*
  * sjb_build_auto(keys int4[], s_rows float8, rows_per_key float8,
  *                row_width float8, network_mbit float8, t_check_ns float8,
- *                max_filter_bytes int8, wire_factor float8) RETURNS bytea
+ *                max_filter_bytes int8, wire_factor float8,
+ *                per_message_ms float8, per_row_us float8,
+ *                t_build_us float8, fetch_size int4) RETURNS bytea
  *
  * What it does: builds the filter the cost model says is fastest:
  *   a) collect the non-NULL keys, sort them, remove duplicates -> n
@@ -838,6 +858,8 @@ PG_FUNCTION_INFO_V1(sjb_build_auto);
  *          t_check_ns    - site B's time to scan + check one row
  *          max_filter_bytes - largest BLOOM/EXACT filter allowed
  *          wire_factor   - wire bytes per filter byte (2 = hex text)
+ *          per_message_ms, per_row_us, t_build_us - calibrated costs
+ *          fetch_size    - rows per postgres_fdw FETCH
  * Output:  the filter (bytea)
  *
  * Why it exists: the filter is chosen at RUNTIME, when the exact number
@@ -864,6 +886,10 @@ sjb_build_auto(PG_FUNCTION_ARGS)
 	inputs.t_check_ns = PG_GETARG_FLOAT8(5);
 	inputs.max_filter_bytes = (double) PG_GETARG_INT64(6);
 	inputs.wire_factor = PG_GETARG_FLOAT8(7);
+	inputs.per_message_ms = PG_GETARG_FLOAT8(8);
+	inputs.per_row_us = PG_GETARG_FLOAT8(9);
+	inputs.t_build_us = PG_GETARG_FLOAT8(10);
+	inputs.fetch_size = PG_GETARG_INT32(11);
 	inputs.t_lookup_us = 0.0;	/* only the index path uses it */
 	inputs.key_text_len = SJB_DEFAULT_KEY_TEXT_LEN;
 	check_cost_inputs(&inputs);
@@ -1036,17 +1062,20 @@ PG_FUNCTION_INFO_V1(sjb_choice_report);
 
 /*
  * sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
- *                   t_check_ns, t_lookup_us float8) RETURNS text
+ *                   t_check_ns, t_lookup_us, per_message_ms, per_row_us,
+ *                   t_build_us float8, fetch_size int4) RETURNS text
  *
  * What it does: runs the cost model (sjb_estimate_all, the same code
  * sjb_build_auto uses) and returns a readable multi-line report: one line
  * for the index path and one for each filter mode, with bytes A->B, rows
- * back, bytes B->A, network time, work at B and total time (in ms), then
- * the best filter mode and the winner.
+ * back, bytes B->A, messages, and the times in ms (network, messages,
+ * returned rows, work at A, work at B, total), then the best filter mode
+ * and the winner.
  *
  * Inputs:  n            - number of distinct keys at site A
  *          s_rows .. t_check_ns - as for sjb_build_auto
- *          t_lookup_us  - site B's time for one index lookup
+ *          t_lookup_us  - time per key of the index path
+ *          per_message_ms .. fetch_size - as for sjb_build_auto
  *          (max_filter_bytes = 1 MB and wire_factor = 2, the defaults)
  * Output:  the report as text
  *
@@ -1072,14 +1101,19 @@ sjb_choice_report(PG_FUNCTION_ARGS)
 	initStringInfo(&report);
 	appendStringInfo(&report,
 					 "inputs: n=%.0f s_rows=%.0f rows_per_key=%g row_width=%.2f "
-					 "network_mbit=%g t_check_ns=%.2f t_lookup_us=%.3f\n",
+					 "network_mbit=%g t_check_ns=%.2f t_lookup_us=%.4f\n",
 					 inputs.num_keys, inputs.s_rows, inputs.rows_per_key,
 					 inputs.row_width, inputs.network_mbit,
 					 inputs.t_check_ns, inputs.t_lookup_us);
+	appendStringInfo(&report,
+					 "        per_message_ms=%.4f per_row_us=%.4f t_build_us=%.4f fetch_size=%.0f\n",
+					 inputs.per_message_ms, inputs.per_row_us,
+					 inputs.t_build_us, inputs.fetch_size);
 	appendStringInfo(&report, "matching rows M = %.0f\n", choice.matching_rows);
-	appendStringInfo(&report, "%-7s %-6s %8s %12s %10s %12s %11s %12s %11s\n",
+	appendStringInfo(&report, "%-7s %-6s %8s %12s %10s %12s %8s %11s %11s %9s %10s %10s %11s\n",
 					 "path", "mode", "bits/key", "bytes_A_to_B", "rows_back",
-					 "bytes_B_to_A", "network_ms", "work_at_B_ms", "total_ms");
+					 "bytes_B_to_A", "messages", "network_ms", "messages_ms",
+					 "rows_ms", "work_A_ms", "work_B_ms", "total_ms");
 
 	append_estimate_line(&report, "index", &choice.index_path);
 	append_estimate_line(&report, "filter", &choice.bloom);
