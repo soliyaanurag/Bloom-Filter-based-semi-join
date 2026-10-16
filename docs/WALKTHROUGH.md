@@ -422,3 +422,132 @@ psql -d site_a -v n=10000 -v b=20 -f queries/byte_estimate.sql
 ```
 
 If the plan shows `Filter: sjb_contains(...)` *above* the Foreign Scan instead of inside the Remote SQL, check that (1) the `extensions 'sjbloom'` server option is set (`SELECT srvoptions FROM pg_foreign_server;`), (2) sjb_contains is IMMUTABLE, and (3) sjbloom is installed in schema public at site B.
+
+## Batch 4: Python benchmarks and the mid-sem charts
+
+In this batch we stop copying numbers out of psql by hand. Python scripts run every strategy for several values of n, measure rows, bytes and time, check correctness, and draw the charts.
+
+### One-time setup: the Python environment
+
+The scripts need two packages, listed in **`bench/requirements.txt`**: `psycopg[binary]` (psycopg 3, the PostgreSQL driver, with its own copy of libpq) and `matplotlib` (charts). They go into a *virtual environment* `.venv/` in the project folder (it is in `.gitignore`).
+
+The usual commands are:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r bench/requirements.txt
+```
+
+On our WSL Ubuntu the first command failed with `ensurepip is not available`, because the Ubuntu package `python3.12-venv` is missing. There are two ways to fix it:
+
+```bash
+# Either install the missing package once (needs sudo), then use the commands above:
+sudo apt install python3.12-venv
+
+# or, without sudo: make the venv without pip, and use the system pip to fill it:
+python3 -m venv --without-pip .venv
+pip --python .venv/bin/python install -r bench/requirements.txt
+```
+
+We used the second way. Check it with `.venv/bin/python -c "import psycopg, matplotlib"`.
+
+Connection settings come from the environment variables `PGHOST`, `PGPORT` and `PGUSER` (`source setup/env.example.sh`), and the password, if your server checks one, from `~/.pgpass`. libpq reads both by itself, so no password appears in the Python code.
+
+### Files
+
+**`bench/common.py`**: small helpers used by all scripts.
+- `connect(dbname)` opens an autocommit connection to site_a or site_b.
+- `explain_json(conn, sql)` runs `EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)` and returns the plan as a Python dict. JSON is a tree we can walk, so we don't need to parse EXPLAIN text.
+- `find_foreign_scan(plan)` walks the tree and returns the `Foreign Scan` node. `remote_rows(node)` = its actual rows × loops, `remote_sql(node)` = the SQL sent to site B, `total_time_ms(plan)` = planning time + execution time.
+- `find_join_above_foreign_scan(plan)` / `join_type(plan)` find the join node above the Foreign Scan. That node is not always the direct parent: in a Hash Join the Foreign Scan sits under a `Hash` node. `is_nestloop_with_join_filter(plan)` is True for a Nested Loop that tests the join condition as a `Join Filter`, which compares every outer row with every inner row.
+- `avg_row_width(width)` runs in site_b: the average text length of the columns that travel. narrow = `customer_id, name` (**16.78 bytes**), wide = `customer_id, name, padding` (**96.78 bytes**).
+- `check_correct(conn, baseline_sql, new_sql)` is the project's correctness test: both `EXCEPT ALL` counts must be 0.
+- `print_table(rows, columns)` prints the readable tables below.
+
+**`bench/strategies.py`**: one function per strategy. Each returns `(sql_text, bytes_a_to_b_sql)`: the query, and a query that returns the bytes site A sends to B, measured as text because postgres_fdw sends parameters as text.
+
+| Strategy | Extra WHERE condition | bytes A->B |
+|---|---|---|
+| `baseline(n, width)` | none | 0 |
+| `exact_keys(n, width)` | `c.customer_id = ANY ((SELECT array_agg(DISTINCT ...))::int[])` | `octet_length(array::text)`, the `{12,345,...}` text postgres_fdw sends |
+| `bloom_fixed10(n, width)` | `sjb_contains(filter, c.customer_id)`, b = 10 | `octet_length(filter::text)`, the hex text |
+| `bloom_dynamic(n, b, width)` | same, with b from the cost model | same |
+
+`width` picks the select list: "narrow" = `o.order_id, c.name`, "wide" also selects `c.padding`. `dynamic_bits(conn, n, row_width)` computes the b for bloom_dynamic *before* the query: `sjb_best_bits(n_distinct, s_rows, n_distinct, row_width, 2)`. Here `n_distinct` = distinct customer_ids of the kept orders, and `s_rows` = `pg_class.reltuples` of the foreign table at site_a (1,000,000). Matches = n_distinct, because every customer_id exists at B. Each width uses its own row width, so the wide variant gets a bigger b (bigger rows make false positives more expensive).
+
+**`bench/run_experiments.py`**: for width in (narrow, wide), n in (100, 1000, 10000, 50000), and each strategy:
+1. Run the query 3 times under EXPLAIN ANALYZE and keep the run with the **median** time.
+2. From that run: `join_type` and `remote_rows`.
+3. `bytes_a_to_b` from the strategy's bytes query. `bytes_b_to_a` = remote_rows × the row width **of this variant**. `total_bytes` = the sum.
+4. `correct` = `check_correct(baseline, strategy)`.
+5. If the join is a **Nested Loop with a Join Filter**, run the same case again after `SET enable_nestloop = off` and record that too (`nestloop_off = True`).
+
+Before measuring, it runs one tiny query on the foreign table, so postgres_fdw's login to site B is not counted in the first measurement. Rows are **appended** to `results/results.csv`, with a `run_at` timestamp. The full table is printed at the end.
+
+**`bench/b_sweep.py`**: n = 10000, b from 2 to 30, for both widths. It runs the Bloom query once per b and saves bytes A->B, bytes B->A and total bytes to `results/b_sweep.csv` (overwritten each run). It prints the predicted b* from `sjb_best_bits`, the measured minimum, and `model_total_bytes`, the total that cost model v1 predicts for each b.
+
+**`bench/plot.py`**: draws the charts into `results/`. For each width: `total_bytes_vs_n_<width>.png`, `time_ms_vs_n_<width>.png`, `remote_rows_vs_n_<width>.png` and `total_bytes_vs_b_<width>.png` (vertical dashed line at the predicted b*). One more chart, `fp_rate.png`, comes from running `queries/fp_rate.sql` from Python (its rows are also saved to `results/fp_rate.csv`). Because results.csv is appended to, plot.py uses the **last** row of each case (strategy, width, n, nestloop_off). All charts use log axes, since the values span several powers of ten.
+
+**`bench/run_all.sh`**: runs the three scripts in order (see "How to rerun" below).
+
+**`bench/capture_bytes.sh`**: optional cross-check with a real packet capture. It runs nothing: it **prints** the `tcpdump` and `capinfos` commands (some need sudo) to capture one Bloom query. psql connects through the Unix socket (`PGHOST=/tmp`), so only postgres_fdw's TCP connection from site A to site B is captured. Expect the capture to be larger than our estimate, because our estimate ignores TCP/IP headers and PostgreSQL's per-row protocol overhead (about 15 bytes per row for 2 columns).
+
+### Results on our machine
+
+Every one of the 36 rows had `correct = True`. Times are in ms (median of 3); bytes are text bytes.
+
+Narrow rows (row width 16.78 bytes):
+
+```
+     strategy |      n |     b |   join_type | nestloop_off | remote_rows | bytes_a_to_b | bytes_b_to_a | total_bytes |  time_ms
+--------------+--------+-------+-------------+--------------+-------------+--------------+--------------+-------------+---------
+     baseline |    100 |       |   Hash Join |        False |   1,000,000 |            0 |   16,777,792 |  16,777,792 | 2,079.15
+   exact_keys |    100 |       | Nested Loop |        False |         100 |          693 |        1,678 |       2,371 |     2.83
+   exact_keys |    100 |       |   Hash Join |         True |         100 |          693 |        1,678 |       2,371 |     1.69
+bloom_fixed10 |    100 |    10 |   Hash Join |        False |      11,481 |          300 |      192,626 |     192,926 |   256.26
+bloom_dynamic |    100 | 26.40 |   Hash Join |        False |         315 |          710 |        5,285 |       5,995 |   157.17
+     baseline |  1,000 |       |   Hash Join |        False |   1,000,000 |            0 |   16,777,792 |  16,777,792 | 1,899.64
+   exact_keys |  1,000 |       | Nested Loop |        False |         999 |        6,887 |       16,761 |      23,648 |   134.20
+   exact_keys |  1,000 |       |   Hash Join |         True |         999 |        6,887 |       16,761 |      23,648 |     7.20
+bloom_fixed10 |  1,000 |    10 |   Hash Join |        False |       9,773 |        2,548 |      163,969 |     166,517 |   211.68
+bloom_dynamic |  1,000 | 21.60 |   Hash Join |        False |       1,077 |        5,446 |       18,070 |      23,516 |   154.59
+     baseline | 10,000 |       |   Hash Join |        False |   1,000,000 |            0 |   16,777,792 |  16,777,792 | 1,924.10
+   exact_keys | 10,000 |       |   Hash Join |        False |       9,955 |       68,605 |      167,023 |     235,628 |    65.67
+bloom_fixed10 | 10,000 |    10 |   Hash Join |        False |      17,921 |       24,938 |      300,675 |     325,613 |   258.41
+bloom_dynamic | 10,000 | 16.80 |   Hash Join |        False |      10,290 |       41,862 |      172,643 |     214,505 |   231.34
+     baseline | 50,000 |       |   Hash Join |        False |   1,000,000 |            0 |   16,777,792 |  16,777,792 | 2,060.47
+   exact_keys | 50,000 |       |   Hash Join |        False |      48,738 |      335,701 |      817,716 |   1,153,417 |   361.30
+bloom_fixed10 | 50,000 |    10 |   Hash Join |        False |      56,495 |      121,896 |      947,861 |   1,069,757 |   388.57
+bloom_dynamic | 50,000 | 13.41 |   Hash Join |        False |      50,269 |      163,446 |      843,403 |   1,006,849 |   362.33
+```
+
+Wide rows (row width 96.78 bytes): same remote rows for baseline, exact_keys and bloom_fixed10. bloom_dynamic picks bigger b values (30.04, 25.25, 20.45, 17.06). Total bytes at n = 10000: baseline 96,777,792; exact_keys 1,032,028; bloom_fixed10 1,759,293; bloom_dynamic 1,019,595.
+
+What the numbers show:
+- **Every filter beats the baseline by a lot.** At n = 10000 the baseline moves 16.8 MB (narrow) or 96.8 MB (wide); the filters move 0.2 to 1.8 MB.
+- **A fixed b = 10 is a bad choice here.** S has 1,000,000 rows, so even a 0.8% false-positive rate lets about 8,000 extra rows through, more than the real matches for small n. bloom_dynamic uses more bits per key and comes back with close to the true number of rows.
+- **Exact keys vs. Bloom.** For small n, the exact list is smallest (no false positives, and a short list). For large n with narrow rows, the dynamic Bloom filter wins: at n = 50000 it sends 163 KB instead of 336 KB, and its few false positives cost less than that difference. With wide rows, false positives are expensive, so the two are close.
+- **Join method.** For exact_keys at n = 100 and 1000, the planner guessed only 10 rows from the Foreign Scan and chose a Nested Loop with a Join Filter. With `enable_nestloop = off` it uses a Hash Join and gets much faster (134 ms → 7 ms at n = 1000). The bytes do not change, only the time. The dashed line in `time_ms_vs_n_*.png` shows this.
+- **Time.** The Bloom strategies take at least about 150 ms even for tiny n, because site B runs `sjb_contains` on all 1,000,000 rows. exact_keys with a Hash Join is faster, because `= ANY` is cheaper per row. All filter strategies are about 5 to 1,200 times faster than the baseline.
+
+`b_sweep.py` (n = 10000):
+
+```
+narrow: measured minimum at b = 16 (214,124 bytes); predicted b* = 16.8
+wide:   measured minimum at b = 20 (1,020,991 bytes); predicted b* = 20.45
+```
+
+The measured minimum lands right next to the predicted b* for both widths, and the cost model's predicted totals are within 1% of the measured ones for b ≥ 6. Near the minimum the curve is flat: at narrow width, b = 14 to 22 are all within 4% of the best.
+
+`fp_rate.png`: the measured false-positive rates lie on the theoretical curve (same numbers as in Batch 2).
+
+### How to rerun all experiments (one command)
+
+```bash
+source setup/env.example.sh
+bench/run_all.sh
+```
+
+This needs the server running (`pg_ctl status`), both sites set up (`setup/setup_all.sh`), and the `.venv` from above. It takes about 5 minutes. It runs `run_experiments.py` (appends to `results/results.csv`), `b_sweep.py` (rewrites `results/b_sweep.csv`) and `plot.py` (rewrites the PNGs and `results/fp_rate.csv`). To start results.csv fresh, delete it first. The scripts can also be run one at a time, e.g. `.venv/bin/python bench/plot.py`.
+
+`results/` is in `.gitignore`, so the CSVs and charts are not committed; every teammate regenerates them on their own machine.

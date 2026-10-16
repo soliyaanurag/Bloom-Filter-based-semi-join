@@ -6,3 +6,4 @@ pg-src/
 .venv/
 sjbloom/results/
 sjbloom/regression.*
+__pycache__/
