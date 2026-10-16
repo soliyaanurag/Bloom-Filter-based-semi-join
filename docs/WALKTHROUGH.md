@@ -113,3 +113,165 @@ psql -d site_a -f queries/param_nestloop.sql         # plan with use_remote_esti
 psql -d site_a -f queries/correctness_exact.sql      # both counts must be 0
 psql -d site_a -v n=10000 -f queries/baseline.sql    # try other sizes with -v n=...
 ```
+
+## Batch 2: the sjbloom extension with a Bloom filter
+
+In this batch we built a PostgreSQL extension in C called `sjbloom`. It adds three SQL functions:
+
+| Function | Runs at | What it does |
+|---|---|---|
+| `sjb_build(keys int4[], m int8, k int4) → bytea` | site A | Builds a Bloom filter with `m` bits from a list of join keys. |
+| `sjb_contains(filter bytea, key int4) → bool` | site B | Says whether a key passes the filter. |
+| `sjb_info(filter bytea) → text` | anywhere | Describes a filter in one line, for debugging. |
+
+Only the BLOOM mode works so far. EXACT and PASS come in Batch 5; until then `sjb_contains` gives the error "filter mode ... is not supported yet" for them.
+
+### What is a Bloom filter?
+
+A Bloom filter is a row of `m` bits, all 0 at the start.
+
+- **Add a key:** compute `k` bit positions from the key and set those bits to 1.
+- **Test a key:** compute the same `k` positions. If **any** of them is 0, the key was certainly never added. If **all** are 1, the key was probably added.
+
+"Probably", because other keys may have set those same bits by chance. That is a **false positive**. A Bloom filter **never** gives a false negative: a key that was added always passes. For our join this is exactly what we need. Site B may send back a few extra rows of S, but never forgets a row that matches. The normal join at site A then throws the extra rows away.
+
+### How one key becomes k bit positions
+
+```
+ key (int4), seed
+        │
+        ▼
+ hashint4extended(key, seed)       PostgreSQL's own int4 hash, 64 bits
+        │
+        ▼
+ ┌──────────── 64-bit hash ────────────┐
+ │   high 32 bits    │   low 32 bits   │
+ └─────────┬─────────┴────────┬────────┘
+           ▼                  ▼
+   h2 = high | 1          h1 = low       (h2 is made odd, so it is never 0)
+
+ position_i = (h1 + i * h2) mod m        for i = 0, 1, ..., k-1
+```
+
+This trick is called **double hashing**: one hash call gives all `k` positions. Bit position `p` is stored in byte `p / 8`, at bit `p % 8` inside that byte.
+
+Example with m = 64 and k = 3: if h1 = 10 and h2 = 7, the positions are 10, 17, 24. So bit 2 of byte 1, bit 1 of byte 2 and bit 0 of byte 3 are set.
+
+We always use PostgreSQL's `hashint4extended` (never our own hash of raw bytes), so site A and site B compute exactly the same positions.
+
+### Filter byte layout
+
+A filter is a `bytea`. PostgreSQL puts its own length header in front, then come our 24-byte header and the payload:
+
+```
+ ┌─────────┬──────────────────────────────── SjbHeader (24 bytes) ───────────────────────────────┬────────────────────┐
+ │ varlena │ version │ mode │    k    │  nkeys  │          m          │         seed          │  Bloom bits        │
+ │ length  │ uint8   │ uint8│ uint16  │ uint32  │       uint64        │        uint64         │  ceil(m/8) bytes   │
+ └─────────┴─────────┴──────┴─────────┴─────────┴─────────────────────┴───────────────────────┴────────────────────┘
+  (PostgreSQL) offset 0  1      2         4         8                     16                     24
+```
+
+- `version` = 1, `mode` = 1 (BLOOM), `k` = positions per key, `nkeys` = how many (non-NULL) keys were added, `m` = number of bits, `seed` = hash seed (0x5EED5EED).
+- The fields are ordered from small to large so the compiler adds no padding. The header is exactly 24 bytes, and a `StaticAssertDecl` makes the build fail if it ever is not.
+- We always copy the header in and out with `memcpy`. Bytes inside a bytea may sit at any address, and reading a `uint64` from an unaligned address by casting a pointer can crash on some machines.
+
+Example: `sjb_info(sjb_build(ARRAY[1,2,3], 64, 3))` gives
+`mode=bloom nkeys=3 m=64 k=3 bits_set=12.50% bytes=32`. That is 24 header bytes + 8 bytes of bits; 3 keys × 3 positions = 9 positions, of which 8 distinct bits ended up set (12.5% of 64).
+
+### Files
+
+**`sjbloom/Makefile`** uses PGXS, PostgreSQL's build system for extensions. `pg_config` (from our install's `bin/`, which is on PATH) tells it where the headers are. `MODULE_big` + `OBJS` say "link sjbloom.o and bloom.o into sjbloom.so". `DATA` is the SQL install script, and `REGRESS` names the regression test.
+
+**`sjbloom/sjbloom.control`** tells `CREATE EXTENSION` the default version (1.0) and where the library is (`$libdir/sjbloom`).
+
+**`sjbloom/sjb_filter.h`** is shared by both C files. It holds the `SjbHeader` struct, the mode numbers, the seed, the allowed ranges for m (8 bits to 64 MB) and k (1 to 32), and the prototypes of the two functions in `bloom.c`.
+
+**`sjbloom/bloom.c`** holds the pure Bloom filter logic, working on a plain array of bytes. It knows nothing about SQL.
+- `compute_two_hashes` hashes a key and splits the result into h1 and h2.
+- `bit_position` computes `(h1 + i*h2) mod m` in 64-bit arithmetic, so it cannot overflow.
+- `set_bit` / `bit_is_set` implement the "byte p/8, bit p%8" rule.
+- `sjb_bloom_add` sets the k bits of one key.
+- `sjb_bloom_test` checks the k bits of one key and returns false at the first 0 bit.
+
+**`sjbloom/sjbloom.c`** holds the three SQL functions, plus helpers that check inputs and filter headers:
+- `sjb_build` checks m and k, unpacks the array, allocates a zero-filled bytea of the right size, adds every non-NULL key, then writes the header.
+- `sjb_contains` copies the header out, checks the version, mode and payload size, then calls `sjb_bloom_test`. A damaged filter gives an error instead of reading past the end of the data.
+- `sjb_info` does the same checks, counts the 1 bits with a simple double loop, and prints one line.
+
+**`sjbloom/sjbloom--1.0.sql`** is run by `CREATE EXTENSION`. It declares the three functions. They are `IMMUTABLE` because postgres_fdw only ships a WHERE condition to the remote server if all its functions are immutable. Without this, site B would send all of S and the filter would be useless. They are `STRICT` so a NULL key automatically gives NULL, which drops the row, just like a NULL never matches in an inner join.
+
+**`sjbloom/sql/sjbloom_basic.sql`** and **`sjbloom/expected/sjbloom_basic.out`** are the regression test and its expected output. It checks:
+- no false negatives for 10000 keys;
+- the false-positive rate is between 0.004 and 0.015 (theory: about 0.0082);
+- an empty array gives nkeys = 0 and passes nothing;
+- NULL array elements are skipped;
+- a NULL key gives NULL;
+- m = 8 works and m = 4 is an error.
+
+**`queries/fp_rate.sql`** compares the measured false-positive rate with the theoretical rate `(1 - e^(-kn/m))^k` for 4, 8, 12, 16 and 22 bits per key, with `k = round(0.693 × b)`. It tests 10000 keys in the filter against 1,000,000 keys that are not in it.
+
+A note on `WITH ... AS MATERIALIZED` in the SQL files: it forces PostgreSQL to build the filter once. Without it, the planner may copy the `sjb_build(...)` call into the WHERE clause and rebuild the filter for every row tested.
+
+### PostgreSQL macros and functions we used
+
+| Name | What it does |
+|---|---|
+| `PG_MODULE_MAGIC` | Puts a "magic block" in the .so so the server refuses a library built for a different major version. |
+| `PG_FUNCTION_INFO_V1(name)` | Declares that C function `name` uses the standard calling convention for SQL functions. |
+| `PG_FUNCTION_ARGS` | The standard parameter list of such a function (one pointer to the call info). |
+| `PG_GETARG_INT32(n)`, `PG_GETARG_INT64(n)` | Read SQL argument number n as a C int32 / int64. |
+| `PG_GETARG_ARRAYTYPE_P(n)` | Read argument n as an SQL array. |
+| `PG_GETARG_BYTEA_PP(n)` | Read argument n as a bytea, decompressing / fetching it from TOAST if needed. It may keep a short 1-byte length header. |
+| `deconstruct_array_builtin` | Unpack an array of a built-in type (here `INT4OID`) into a C array of Datums and a C array of null flags. |
+| `Datum`, `Int32GetDatum`, `Int64GetDatum`, `DatumGetInt32`, `DatumGetUInt64` | A Datum is PostgreSQL's "any value" type; these macros wrap C values into Datums and unwrap them again. |
+| `DirectFunctionCall2(f, a, b)` | Call an SQL-callable C function (here `hashint4extended`) directly from C with two arguments. |
+| `palloc0(size)` | Allocate zero-filled memory in the current memory context. It is freed automatically at the end of the query. |
+| `VARHDRSZ` | Size (4 bytes) of the length header in front of every bytea/text value. |
+| `SET_VARSIZE(ptr, size)` | Write the total size into that length header. |
+| `VARDATA(ptr)` | Pointer to the data just after a 4-byte length header (used on our own freshly built bytea). |
+| `VARDATA_ANY(ptr)`, `VARSIZE_ANY_EXHDR(ptr)` | Pointer to the data and size of the data for a bytea with either a 1-byte or 4-byte length header. |
+| `ereport(ERROR, (errcode(...), errmsg(...)))` | Raise an SQL error: stops the function and aborts the query. |
+| `StaticAssertDecl(cond, msg)` | Check a condition at compile time. |
+| `UINT64CONST(x)` | Write a 64-bit unsigned constant portably. |
+| `psprintf` | Like sprintf, but returns a new palloc'd string. |
+| `cstring_to_text` | Turn a C string into an SQL `text` value. |
+| `PG_RETURN_BYTEA_P`, `PG_RETURN_BOOL`, `PG_RETURN_TEXT_P` | Return a value from the C function to SQL. |
+
+### How to test it
+
+```bash
+cd sjbloom
+make                 # compile (should print no warnings)
+make install         # installs into ~/postgres/postgresql/install, no sudo needed
+make installcheck    # runs sql/sjbloom_basic.sql, compares with expected/
+```
+
+`make installcheck` should end with `# All 1 tests passed.` If it fails, look at `sjbloom/regression.diffs`.
+
+Then load the extension into both sites and run the false-positive experiment:
+
+```bash
+psql -d site_a -c "CREATE EXTENSION sjbloom;" -c "SELECT sjb_info(sjb_build(ARRAY[1,2,3], 64, 3));"
+psql -d site_b -c "CREATE EXTENSION sjbloom;" -c "SELECT sjb_info(sjb_build(ARRAY[1,2,3], 64, 3));"
+psql -d site_a -f queries/fp_rate.sql
+```
+
+Both sites should print `mode=bloom nkeys=3 m=64 k=3 bits_set=12.50% bytes=32`.
+
+**Note:** `setup/setup_all.sh` drops and recreates both databases and does not create sjbloom. After running it, run the two `CREATE EXTENSION sjbloom;` commands above again.
+
+Results in site_a (the measured rates match the theory closely):
+
+```
+ bits_per_key |   m    | k  | measured_fp | predicted_fp
+--------------+--------+----+-------------+--------------
+            4 |  40000 |  3 |    0.145977 |     0.146892
+            8 |  80000 |  6 |    0.021581 |     0.021577
+           12 | 120000 |  8 |    0.003116 |     0.003142
+           16 | 160000 | 11 |    0.000431 |     0.000459
+           22 | 220000 | 15 |    0.000024 |     0.000026
+```
+
+Each extra 4 bits per key cuts the false-positive rate by roughly a factor of 7 to 10. This is the trade-off the cost model will use later: a bigger filter costs more bytes to send, but lets fewer useless rows of S come back.
+
+After changing `sjbloom--1.0.sql`, reinstall and recreate the extension: `make install`, then `DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom;` in each database.
