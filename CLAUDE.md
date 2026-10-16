@@ -45,3 +45,11 @@ A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chose
 - NEVER run sudo yourself. Print the exact sudo command, ask me to run it, and wait.
 - Never write passwords into committed files.
 - If a check fails, do not hack around it. Show me the output and explain what you think is wrong.
+
+## Current status and lessons learned
+- Batches 0, 1 and 2 are done and committed. Next is Batch 3.
+- postgres_fdw was installed by the user from the source tree. Do not reinstall it, and never touch ~/postgres/postgresql.
+- `= ANY` with a sub-SELECT needs an `::int[]` cast: `= ANY ((SELECT array_agg(...) ...)::int[])`. Without it, PostgreSQL treats the subquery as a row set and fails with "operator does not exist: integer = integer[]".
+- In test queries, build filters in a `WITH ... AS MATERIALIZED` CTE so they are built once, not once per row.
+- setup/setup_all.sh drops both sites, so sjbloom must be created again in both (Batch 3 automates this).
+- The planner underestimates foreign scan rows for `= ANY` (it guessed 10; the real number was 999) and picks a nested loop. Keep this in mind for timing measurements later.
