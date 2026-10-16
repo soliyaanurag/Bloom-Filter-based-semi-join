@@ -47,9 +47,10 @@ A cost model chooses the mode and the Bloom filter size m (dynamic sizing, chose
 - If a check fails, do not hack around it. Show me the output and explain what you think is wrong.
 
 ## Current status and lessons learned
-- Batches 0, 1 and 2 are done and committed. Next is Batch 3.
+- Batches 0, 1, 2 and 3 are done and committed. Next is Batch 4.
 - postgres_fdw was installed by the user from the source tree. Do not reinstall it, and never touch ~/postgres/postgresql.
 - `= ANY` with a sub-SELECT needs an `::int[]` cast: `= ANY ((SELECT array_agg(...) ...)::int[])`. Without it, PostgreSQL treats the subquery as a row set and fails with "operator does not exist: integer = integer[]".
 - In test queries, build filters in a `WITH ... AS MATERIALIZED` CTE so they are built once, not once per row.
-- setup/setup_all.sh drops both sites, so sjbloom must be created again in both (Batch 3 automates this).
+- setup/setup_all.sh drops both sites, then (since Batch 3) creates sjbloom in both and runs setup/enable_sjbloom.sql. The extension must be installed first (make -C sjbloom install).
+- Bloom false positives scale with the size of S, not R': at b=10 (fp ~0.8%) about 8,000 of the 999k non-matching customers pass. Use sjb_best_bits to pick b.
 - The planner underestimates foreign scan rows for `= ANY` (it guessed 10; the real number was 999) and picks a nested loop. Keep this in mind for timing measurements later.

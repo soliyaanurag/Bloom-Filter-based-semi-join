@@ -258,7 +258,7 @@ psql -d site_a -f queries/fp_rate.sql
 
 Both sites should print `mode=bloom nkeys=3 m=64 k=3 bits_set=12.50% bytes=32`.
 
-**Note:** `setup/setup_all.sh` drops and recreates both databases and does not create sjbloom. After running it, run the two `CREATE EXTENSION sjbloom;` commands above again.
+**Note:** `setup/setup_all.sh` drops and recreates both databases. Since Batch 3 it also creates sjbloom in both sites for you.
 
 Results in site_a (the measured rates match the theory closely):
 
@@ -275,3 +275,150 @@ Results in site_a (the measured rates match the theory closely):
 Each extra 4 bits per key cuts the false-positive rate by roughly a factor of 7 to 10. This is the trade-off the cost model will use later: a bigger filter costs more bytes to send, but lets fewer useless rows of S come back.
 
 After changing `sjbloom--1.0.sql`, reinstall and recreate the extension: `make install`, then `DROP EXTENSION sjbloom CASCADE; CREATE EXTENSION sjbloom;` in each database.
+
+## Batch 3: the Bloom semi-join by hand, and cost model version 1
+
+In this batch the Bloom filter crosses the network for the first time. We write the semi-join by hand in SQL (no changes to postgres_fdw yet), check that the result is exactly right, measure the bytes, and add a formula that picks the best filter size.
+
+### Files
+
+**`setup/enable_sjbloom.sql`** (run in site_a) makes sure sjbloom exists in site_b and site_a (`CREATE EXTENSION IF NOT EXISTS`, using `\connect` to switch databases), then runs:
+
+```sql
+ALTER SERVER site_b_srv OPTIONS (ADD extensions 'sjbloom');
+```
+
+postgres_fdw only sends a WHERE condition to site B if it is sure site B can run it. It trusts built-in functions, but for extension functions it only trusts the extensions named in the server option `extensions`. **Without this option**, sjb_contains stays at site A: B sends all 1,000,000 customers and A filters them (`Filter: sjb_contains(...)` above the Foreign Scan). The result would still be correct, but nothing would be saved on the network. Run the file only once: a second `ADD` fails because the option already exists.
+
+**`setup/setup_all.sh`** now has 5 steps. After the 3 old ones it runs `CREATE EXTENSION sjbloom` in site_b and in site_a, then `enable_sjbloom.sql`. Before the very first run, install the extension once with `make -C sjbloom install`. During step 5 psql prints two `extension "sjbloom" already exists, skipping` notices. That is expected: step 4 already created it.
+
+**`queries/bloom_manual.sql`** is the join with a Bloom semi-join, under `EXPLAIN (ANALYZE, VERBOSE)`. psql variables: `n` (orders kept, default 1000) and `b` (filter bits per key, default 10). The filter is built from the distinct customer_ids of the kept orders, with `m = max(8, b × keys)` bits and `k = max(1, round(0.693 × b))` positions per key. That k gives the lowest false-positive rate for b bits per key.
+
+**`queries/correctness_bloom.sql`** runs **`queries/correctness_bloom_one.sql`** (with psql's `\ir`, "include a file from this folder") for n = 100, 1000 and 10000. Each run prints `baseline_except_bloom` and `bloom_except_baseline`, the two EXCEPT ALL counts. Both must be 0. You can change b with `-v b=4`.
+
+**`queries/byte_estimate.sql`** estimates the network bytes for one n and b:
+- `bytes_a_to_b` = `octet_length(filter::text)`: the filter as hex text, which is how postgres_fdw sends it (2 × binary size + 2 bytes for `\x`).
+- `avg_row_width` = average of `octet_length(customer_id::text) + octet_length(name)` over all customers. Only these two columns travel, because the query only needs them. postgres_fdw runs this `avg(...)` at site B and gets back one number.
+- `remote_rows` = how many customers pass the filter. We count them with the same pushed-down `sjb_contains` condition, so it equals the Foreign Scan's "actual rows" in `bloom_manual.sql` without copying numbers by hand.
+- `bytes_b_to_a` = `remote_rows × avg_row_width`, and `baseline_bytes_b_to_a` = all 1,000,000 rows × width, for comparison.
+
+Small protocol overheads (message headers, a few bytes per row) are ignored.
+
+**`sjbloom/sjbloom--1.0.sql`** has a new SQL function **`sjb_best_bits(n, s_rows, matches, row_width, wire_factor DEFAULT 2)`**: cost model version 1 (see below). It is `LANGUAGE sql IMMUTABLE`, so no C code was needed. After `make install` the extension was recreated in both sites (here by rerunning `setup_all.sh`).
+
+### Data flow of the manual Bloom query
+
+```
+ SITE A (site_a)                                          SITE B (site_b)
+ ───────────────                                          ───────────────
+ 1. InitPlan 1 (runs once, before the join):
+    SELECT sjb_build(array_agg(DISTINCT customer_id), m, k)
+    FROM orders WHERE order_id <= n
+      → ~1,000 distinct keys → bytea filter (1,273 bytes for n=1000, b=10)
+
+ 2. The filter becomes parameter $1.
+
+ 3. Foreign Scan sends the Remote SQL, with $1 as hex text ──────►
+    SELECT customer_id, name FROM public.customers
+    WHERE public.sjb_contains($1::bytea, customer_id)
+                                                          4. B scans customers and keeps
+                                                             only rows whose id passes the
+                                                             filter: all ~1,000 real matches
+                                                             + false positives.
+                           ◄────── rows come back as text
+ 5. Hash Join (exact): orders ⋈ returned customers ON customer_id.
+    False positives find no order and are dropped.
+    → exactly the baseline result.
+```
+
+Step by step:
+1. **InitPlan builds the filter.** The sub-SELECT inside `sjb_contains(...)` does not depend on the row of customers, so PostgreSQL runs it once as an *InitPlan*, before the join.
+2. **The filter becomes `$1`.** The InitPlan's result is a query parameter.
+3. **Remote SQL.** Because sjb_contains is IMMUTABLE, belongs to an extension listed in the server's `extensions` option, and its arguments are a parameter and a column, postgres_fdw puts the whole condition into the SQL it sends to B. The parameter travels as text, so the bytea filter is sent as hex.
+4. **B filters.** Site B runs `sjb_contains` for each of its 1,000,000 rows and returns only the rows that pass, which is the approximate semi-join S ⋉ R'.
+5. **Exact join at A.** The normal hash join on `customer_id` keeps only true matches, so Bloom false positives never reach the result.
+
+### Results on our machine
+
+`bloom_manual.sql` with n = 1000, b = 10 (shortened):
+
+```
+ Hash Join  (actual time=4.243..177.219 rows=1000.00 loops=1)
+   Hash Cond: (c.customer_id = o.customer_id)
+   InitPlan 1
+     ->  Aggregate  (actual rows=1.00 loops=1)
+           Output: sjb_build(array_agg(DISTINCT orders.customer_id), (GREATEST('8'::double precision, ceil(((count(DISTINCT orders.customer_id) * 10))::double precision)))::bigint, 7)
+   ->  Foreign Scan on public.customers c  (cost=100.00..99756.93 rows=333333 width=15) (actual time=3.826..174.989 rows=9773.00 loops=1)
+         Remote SQL: SELECT customer_id, name FROM public.customers WHERE (public.sjb_contains($1::bytea, customer_id))
+ Execution Time: 179.901 ms
+```
+
+`sjb_contains($1::bytea, customer_id)` is inside the Remote SQL, and there is no `Filter:` line at A. Site B returned **9,773** rows instead of 1,000,000.
+
+Why 9,773 and not "1,000 plus a few"? The false-positive rate (about 0.8% at b = 10) applies to **each of the 999,001 customers that do not match**. The filter had 50.69% of its bits set, so the predicted rate is 0.5069^7 ≈ 0.0086. 999,001 × 0.0086 ≈ 8,600 false positives, and we measured 8,774 (rate 0.0088). So b = 10 is too small for this data. That is exactly what the cost model below is for. With b = 20 only 80 false positives come back (see the table).
+
+Also note the planner's guess `rows=333333`. It doesn't know what sjb_contains does, so it assumes a default selectivity of 1/3. Remember this for timing measurements later.
+
+`correctness_bloom.sql` (b = 10): all six counts are 0.
+
+```
+   n   | baseline_except_bloom | bloom_except_baseline
+-------+-----------------------+-----------------------
+   100 |                     0 |                     0
+  1000 |                     0 |                     0
+ 10000 |                     0 |                     0
+```
+
+`byte_estimate.sql` with n = 10000 (9,955 distinct keys; average row width 16.78 bytes as text):
+
+```
+  b | bytes_a_to_b | remote_rows | false_positives | bytes_b_to_a | total_bytes | baseline_bytes_b_to_a
+----+--------------+-------------+-----------------+--------------+-------------+-----------------------
+ 10 |       24,938 |      17,921 |           7,966 |      300,675 |     325,613 |            16,777,792
+ 20 |       49,826 |      10,035 |              80 |      168,365 |     218,191 |            16,777,792
+```
+
+The `remote_rows` numbers match the Foreign Scan's actual rows in `bloom_manual.sql -v n=10000` (17,921 and 10,035). Doubling the filter costs 25 KB more A→B, but saves 132 KB B→A. Both are far below the 16.8 MB baseline.
+
+### Cost model version 1: `sjb_best_bits`
+
+For b bits per key, the bytes on the network are:
+
+| Part | Bytes | Depends on b? |
+|---|---|---|
+| filter, A→B | n × b / 8 × wire_factor | grows with b |
+| true-match rows, B→A | matches × row_width | no |
+| false-positive rows, B→A | (s_rows − matches) × row_width × e^(−0.4805 b) | shrinks with b |
+
+`e^(−0.4805 b)` is the Bloom false-positive rate with the best k (0.4805 = (ln 2)²). `wire_factor` = 2 because the filter travels as hex text. Setting the derivative of the total to 0 gives the b with the smallest total:
+
+```
+b* = ln( 8 × 0.4805 × (s_rows − matches) × row_width / (n × wire_factor) ) / 0.4805
+```
+
+If the value inside ln() is ≤ 1, even a tiny filter costs more than the false positives it would remove. The function then returns 0, meaning "Bloom is not worth it". It also returns 0 for n ≤ 0.
+
+```
+SELECT sjb_best_bits(10000, 1000000, 10000, 100, 1);   → 21.95
+SELECT sjb_best_bits(10000, 1000000, 10000, 100, 2);   → 20.51
+SELECT sjb_best_bits(1000000, 1000000, 900000, 1, 2);  → 0   (not worth it)
+SELECT sjb_best_bits(9955, 1000000, 9955, 16.78);      → 16.80 (our real n=10000 query)
+```
+
+For our real query (rows are only ~17 bytes as text, since just customer_id and name travel), the best b is about 17. That is between the two runs above, and both are already close to the best total.
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom install                  # after any change to the extension
+setup/setup_all.sh                        # rebuilds both sites, sjbloom included (~5 s)
+psql -d site_a -f queries/bloom_manual.sql                 # look for sjb_contains in Remote SQL
+psql -d site_a -f queries/correctness_bloom.sql            # all counts must be 0
+psql -d site_a -c "SELECT sjb_best_bits(10000, 1000000, 10000, 100, 1);"   # about 22
+psql -d site_a -c "SELECT sjb_best_bits(10000, 1000000, 10000, 100, 2);"   # about 20.5
+psql -d site_a -v n=10000 -v b=10 -f queries/byte_estimate.sql
+psql -d site_a -v n=10000 -v b=20 -f queries/byte_estimate.sql
+```
+
+If the plan shows `Filter: sjb_contains(...)` *above* the Foreign Scan instead of inside the Remote SQL, check that (1) the `extensions 'sjbloom'` server option is set (`SELECT srvoptions FROM pg_foreign_server;`), (2) sjb_contains is IMMUTABLE, and (3) sjbloom is installed in schema public at site B.

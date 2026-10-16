@@ -6,6 +6,11 @@
 #   2. site_b_data.sql   - create and fill customers (1,000,000 rows) at B
 #   3. site_a_setup.sql  - create and fill orders (200,000 rows) at A and
 #                          connect A to B with postgres_fdw
+#   4. CREATE EXTENSION sjbloom in site_b and in site_a
+#   5. enable_sjbloom.sql - let postgres_fdw send sjbloom functions to B
+#
+# Before the first run, build and install the extension once:
+#     make -C sjbloom install
 #
 # Usage (from the project folder):
 #     source setup/env.example.sh
@@ -29,13 +34,20 @@ if [ -z "${PGPASSWORD:-}" ]; then
     echo "      That is fine if your server uses trust authentication."
 fi
 
-echo "=== Step 1/3: create site_a and site_b ==="
+echo "=== Step 1/5: create site_a and site_b ==="
 $PSQL -d postgres -f "$SETUP_DIR/create_sites.sql"
 
-echo "=== Step 2/3: load customers into site_b ==="
+echo "=== Step 2/5: load customers into site_b ==="
 $PSQL -d site_b -f "$SETUP_DIR/site_b_data.sql"
 
-echo "=== Step 3/3: load orders into site_a and set up postgres_fdw ==="
+echo "=== Step 3/5: load orders into site_a and set up postgres_fdw ==="
 $PSQL -v pgpass="${PGPASSWORD:-}" -d site_a -f "$SETUP_DIR/site_a_setup.sql"
+
+echo "=== Step 4/5: create the sjbloom extension in site_b and site_a ==="
+$PSQL -d site_b -c "CREATE EXTENSION sjbloom;"
+$PSQL -d site_a -c "CREATE EXTENSION sjbloom;"
+
+echo "=== Step 5/5: let postgres_fdw send sjbloom functions to site_b ==="
+$PSQL -d site_a -f "$SETUP_DIR/enable_sjbloom.sql"
 
 echo "=== Setup finished ==="
