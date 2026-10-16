@@ -129,7 +129,20 @@ Possible future improvements (**not done**, both would change a fixed design dec
 - not forcing h2 to be odd, which would halve the floor when m is even (we counted 13 instead of 25 at n = 100);
 - taking more hash bits per key, for example a second `hashint4extended` call with another seed.
 
-## 5. Compatibility: filter version 2
+## 5. Effect on the benchmark
+
+We reran the full Batch 4 benchmark (`bench/run_all.sh`) with enhanced double hashing. All 36 rows are still exactly correct. Rows that site B sends back for `bloom_dynamic` (narrow rows; false positives = rows − distinct keys):
+
+| n | b | distinct keys | rows from B, v1 | rows from B, v2 | false positives v1 → v2 | total bytes v1 → v2 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 26.40 | 100 | 315 | 137 | 215 → 37 | 5,995 → 3,009 |
+| 1,000 | 21.60 | 999 | 1,077 | 1,026 | 78 → 27 | 23,516 → 22,660 |
+| 10,000 | 16.80 | 9,955 | 10,290 | 10,265 | 335 → 310 | 214,505 → 214,086 |
+| 50,000 | 13.41 | 48,738 | 50,269 | 50,240 | 1,531 → 1,502 | 1,006,849 → 1,006,362 |
+
+At n = 100 the Bloom query now moves half the bytes. At n = 1,000 `bloom_dynamic` (22,660 bytes) now beats the exact key list (23,648 bytes). For large n nothing changes, as expected. The b sweep (n = 10,000) still has its minimum next to the predicted b*: narrow b = 18 (b* = 16.8; b = 16 and b = 18 differ by only 0.2%), wide b = 20 (b* = 20.45). The old charts are kept in `docs/midsem/v1/`, and the new ones are in `docs/midsem/`.
+
+## 6. Compatibility: filter version 2
 
 Site A builds the filter and site B tests keys against it, so both **must** compute the same positions. A filter built by the old code but read with the new positions could silently drop matching rows (false negatives), and the join result would be wrong. So the filter header's version went from 1 to 2 (`SJB_VERSION` in `sjbloom/sjb_filter.h`). A filter with any other version is refused:
 
@@ -138,7 +151,7 @@ ERROR:  sjbloom: filter has version 1, but this sjbloom understands only version
 HINT:  Site A and site B must run the same sjbloom build. Install it on both sites and rebuild the filter.
 ```
 
-## 6. How to reproduce
+## 7. How to reproduce
 
 ```bash
 source setup/env.example.sh
