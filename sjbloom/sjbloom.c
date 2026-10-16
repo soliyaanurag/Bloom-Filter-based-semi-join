@@ -404,3 +404,117 @@ sjb_info(PG_FUNCTION_ARGS)
 	 */
 	PG_RETURN_TEXT_P(cstring_to_text(description));
 }
+
+
+/*
+ * ---------------------------------------------------------------------
+ * TEMPORARY (branch fp-investigation): sjb_build_v2 / sjb_contains_v2.
+ *
+ * Exact copies of sjb_build / sjb_contains, except that they call
+ * sjb_bloom_add_v2 / sjb_bloom_test_v2 (enhanced double hashing, see
+ * bloom.c). The filter format is the same, but a v2 filter must only be
+ * tested with sjb_contains_v2, because the bit positions differ.
+ *
+ * They are NOT in sjbloom--1.0.sql: queries/fp_v1_v2.sql declares them as
+ * temporary functions (schema pg_temp) that disappear when the session
+ * ends. Remove this block when the investigation is finished.
+ * ---------------------------------------------------------------------
+ */
+
+PG_FUNCTION_INFO_V1(sjb_build_v2);
+
+/*
+ * sjb_build_v2(keys int4[], m int8, k int4) RETURNS bytea
+ *
+ * What it does: the same as sjb_build, with enhanced double hashing.
+ * Inputs / output: the same as sjb_build.
+ * Why it exists: TEMPORARY, for the false-positive investigation.
+ */
+Datum
+sjb_build_v2(PG_FUNCTION_ARGS)
+{
+	ArrayType  *keys_array = PG_GETARG_ARRAYTYPE_P(0);
+	int64		m = PG_GETARG_INT64(1);
+	int32		k = PG_GETARG_INT32(2);
+	Datum	   *elements;
+	bool	   *nulls;
+	int			num_elements;
+	uint64		payload_bytes;
+	Size		total_size;
+	bytea	   *result;
+	uint8	   *bits;
+	SjbHeader	header;
+	uint32		num_keys_added = 0;
+	int			i;
+
+	check_bloom_parameters(m, k);
+
+	deconstruct_array_builtin(keys_array, INT4OID,
+							  &elements, &nulls, &num_elements);
+
+	payload_bytes = bloom_payload_bytes((uint64) m);
+	total_size = VARHDRSZ + sizeof(SjbHeader) + payload_bytes;
+	result = (bytea *) palloc0(total_size);
+	SET_VARSIZE(result, total_size);
+
+	bits = (uint8 *) VARDATA(result) + sizeof(SjbHeader);
+
+	for (i = 0; i < num_elements; i++)
+	{
+		int32		key;
+
+		if (nulls[i])
+			continue;
+
+		key = DatumGetInt32(elements[i]);
+		sjb_bloom_add_v2(bits, (uint64) m, k, SJB_SEED, key);
+		num_keys_added = num_keys_added + 1;
+	}
+
+	memset(&header, 0, sizeof(header));
+	header.version = SJB_VERSION;
+	header.mode = SJB_MODE_BLOOM;
+	header.k = (uint16) k;
+	header.nkeys = num_keys_added;
+	header.m = (uint64) m;
+	header.seed = SJB_SEED;
+	memcpy(VARDATA(result), &header, sizeof(SjbHeader));
+
+	PG_RETURN_BYTEA_P(result);
+}
+
+
+PG_FUNCTION_INFO_V1(sjb_contains_v2);
+
+/*
+ * sjb_contains_v2(filter bytea, key int4) RETURNS bool
+ *
+ * What it does: the same as sjb_contains, with enhanced double hashing.
+ * Inputs / output: the same as sjb_contains.
+ * Why it exists: TEMPORARY, for the false-positive investigation.
+ */
+Datum
+sjb_contains_v2(PG_FUNCTION_ARGS)
+{
+	bytea	   *filter = PG_GETARG_BYTEA_PP(0);
+	int32		key = PG_GETARG_INT32(1);
+	const char *filter_data = VARDATA_ANY(filter);
+	Size		filter_size = VARSIZE_ANY_EXHDR(filter);
+	SjbHeader	header;
+	Size		payload_size;
+	const uint8 *bits;
+	bool		passes;
+
+	read_header(filter_data, filter_size, &header);
+
+	if (header.mode != SJB_MODE_BLOOM)
+		error_mode_not_supported(header.mode);
+
+	payload_size = filter_size - sizeof(SjbHeader);
+	check_bloom_filter(&header, payload_size);
+
+	bits = (const uint8 *) filter_data + sizeof(SjbHeader);
+	passes = sjb_bloom_test_v2(bits, header.m, header.k, header.seed, key);
+
+	PG_RETURN_BOOL(passes);
+}

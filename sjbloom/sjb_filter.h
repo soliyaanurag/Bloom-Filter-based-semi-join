@@ -82,4 +82,8 @@ StaticAssertDecl(sizeof(SjbHeader) == 24, "SjbHeader must be exactly 24 bytes");
 extern void sjb_bloom_add(uint8 *bits, uint64 m, int k, uint64 seed, int32 key);
 extern bool sjb_bloom_test(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key);
 
+/* TEMPORARY (branch fp-investigation): enhanced double hashing versions. */
+extern void sjb_bloom_add_v2(uint8 *bits, uint64 m, int k, uint64 seed, int32 key);
+extern bool sjb_bloom_test_v2(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key);
+
 #endif							/* SJB_FILTER_H */

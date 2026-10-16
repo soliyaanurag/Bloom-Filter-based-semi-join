@@ -192,3 +192,107 @@ sjb_bloom_test(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
 
 	return true;
 }
+
+
+/*
+ * ---------------------------------------------------------------------
+ * TEMPORARY (branch fp-investigation): "enhanced double hashing", the
+ * method PostgreSQL's own src/backend/lib/bloomfilter.c uses. Only the way
+ * the k positions are computed differs from the functions above; the hash
+ * (compute_two_hashes), the bit layout and set_bit / bit_is_set are the
+ * same. Used by sjb_build_v2 / sjb_contains_v2 to compare false-positive
+ * rates. Not part of the fixed design: do not use outside the experiment.
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * compute_positions_v2
+ *
+ * What it does: fills positions[0 .. k-1] using enhanced double hashing,
+ * following PostgreSQL's k_hashes():
+ *     x = h1 mod m,  y = h2 mod m
+ *     position_0 = x
+ *     for i = 1 .. k-1:   x = (x + y) mod m
+ *                         y = (y + i) mod m
+ *                         position_i = x
+ * Because y grows by 1, 2, 3, ... the step between positions changes
+ * every time, so the positions no longer form an evenly spaced row
+ * (h1, h1 + h2, h1 + 2*h2, ...) like classic double hashing does.
+ *
+ * Inputs:  h1, h2    - the two hash values from compute_two_hashes
+ *          k         - number of positions (at most SJB_MAX_K)
+ *          m         - number of bits in the filter
+ * Output:  positions - array of at least k entries, filled in
+ *
+ * Why it exists: to test whether classic double hashing causes the extra
+ * false positives we measured for small filters.
+ * (PostgreSQL uses "& (m - 1)" because its m is always a power of two;
+ * our m can be any number, so we use "% m". All values stay below m, so
+ * x + y and y + i cannot overflow a uint64.)
+ */
+static void
+compute_positions_v2(uint32 h1, uint32 h2, int k, uint64 m, uint64 *positions)
+{
+	uint64		x = (uint64) h1 % m;
+	uint64		y = (uint64) h2 % m;
+	int			i;
+
+	positions[0] = x;
+	for (i = 1; i < k; i++)
+	{
+		x = (x + y) % m;
+		y = (y + (uint64) i) % m;
+		positions[i] = x;
+	}
+}
+
+/*
+ * sjb_bloom_add_v2
+ *
+ * What it does: the same as sjb_bloom_add, but with enhanced double
+ * hashing (compute_positions_v2).
+ * Inputs / output: the same as sjb_bloom_add.
+ * Why it exists: TEMPORARY, for the false-positive investigation.
+ */
+void
+sjb_bloom_add_v2(uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
+{
+	uint32		h1;
+	uint32		h2;
+	uint64		positions[SJB_MAX_K];
+	int			i;
+
+	compute_two_hashes(key, seed, &h1, &h2);
+	compute_positions_v2(h1, h2, k, m, positions);
+
+	for (i = 0; i < k; i++)
+		set_bit(bits, positions[i]);
+}
+
+/*
+ * sjb_bloom_test_v2
+ *
+ * What it does: the same as sjb_bloom_test, but with enhanced double
+ * hashing (compute_positions_v2).
+ * Inputs / output: the same as sjb_bloom_test.
+ * Why it exists: TEMPORARY, for the false-positive investigation.
+ */
+bool
+sjb_bloom_test_v2(const uint8 *bits, uint64 m, int k, uint64 seed, int32 key)
+{
+	uint32		h1;
+	uint32		h2;
+	uint64		positions[SJB_MAX_K];
+	int			i;
+
+	compute_two_hashes(key, seed, &h1, &h2);
+	compute_positions_v2(h1, h2, k, m, positions);
+
+	for (i = 0; i < k; i++)
+	{
+		if (!bit_is_set(bits, positions[i]))
+			return false;
+	}
+
+	return true;
+}
