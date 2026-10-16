@@ -139,16 +139,20 @@ Possible future improvement (**not done**; it would change the fixed design deci
 
 ## 5. Effect on the benchmark
 
-We reran the full Batch 4 benchmark (`bench/run_all.sh`) with enhanced double hashing. All 36 rows are still exactly correct. Rows that site B sends back for `bloom_dynamic` (narrow rows; false positives = rows − distinct keys):
+We reran the full Batch 4 benchmark (`bench/run_all.sh`) after each change. All 36 rows are exactly correct every time. Results for `bloom_dynamic`, narrow rows (false positives = rows from B − distinct keys):
 
-| n | b | distinct keys | rows from B, v1 | rows from B, v2 | false positives v1 → v2 | total bytes v1 → v2 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 100 | 26.40 | 100 | 315 | 137 | 215 → 37 | 5,995 → 3,009 |
-| 1,000 | 21.60 | 999 | 1,077 | 1,026 | 78 → 27 | 23,516 → 22,660 |
-| 10,000 | 16.80 | 9,955 | 10,290 | 10,265 | 335 → 310 | 214,505 → 214,086 |
-| 50,000 | 13.41 | 48,738 | 50,269 | 50,240 | 1,531 → 1,502 | 1,006,849 → 1,006,362 |
+| n | b | distinct keys | false positives v1 → v2 → v3 | total bytes v1 → v2 → v3 | time (ms) v1 → v2 → v3 |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 26.40 | 100 | 215 → 37 → **23** | 5,995 → 3,009 → **2,774** | 157 → 240 → **164** |
+| 1,000 | 21.60 | 999 | 78 → 27 → **36** | 23,516 → 22,660 → **22,811** | 155 → 229 → **163** |
+| 10,000 | 16.80 | 9,955 | 335 → 310 → **315** | 214,505 → 214,086 → **214,170** | 231 → 282 → **242** |
+| 50,000 | 13.41 | 48,738 | 1,531 → 1,502 → **1,520** | 1,006,849 → 1,006,362 → **1,006,664** | 362 → 379 → **373** |
 
-At n = 100 the Bloom query now moves half the bytes. At n = 1,000 `bloom_dynamic` (22,660 bytes) now beats the exact key list (23,648 bytes). For large n nothing changes, as expected. The b sweep (n = 10,000) still has its minimum next to the predicted b*: narrow b = 18 (b* = 16.8; b = 16 and b = 18 differ by only 0.2%), wide b = 20 (b* = 20.45). The old charts are kept in `docs/midsem/v1/`, and the new ones are in `docs/midsem/`.
+- **Bytes.** At n = 100 the Bloom query now moves less than half the bytes of v1. At n = 1,000 `bloom_dynamic` (22,811 bytes) beats the exact key list (23,648 bytes). For large n nothing changes, as expected.
+- **Time.** v2 was slower, because the first version of the new code computed all k positions before testing any bit. v3 includes an *early exit*: positions are computed one at a time and the test stops at the first 0 bit (the positions are unchanged). On its own, a full scan of the 1,000,000 customers at site B with the n = 100 filter dropped from 102.7 ms to 69.2 ms. Times are single-machine medians of 3 runs, so differences of about ±10% are noise.
+- **b sweep** (n = 10,000): the minimum is still next to the predicted b*: narrow b = 18 (b* = 16.8; b = 16 to 18 are within 0.3%), wide b = 20 (b* = 20.45).
+
+The original Batch 4 charts (v1) are kept in `docs/midsem/v1/`; `docs/midsem/` has the current (v3) ones.
 
 ## 6. Compatibility: the filter version
 
