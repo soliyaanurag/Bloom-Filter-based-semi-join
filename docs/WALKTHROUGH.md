@@ -1421,3 +1421,117 @@ psql -X -d site_a -f queries/correctness_auto.sql                               
 ```
 
 Note: like sjbloom's header, `postgres_fdw.h` is not tracked by this tree's Makefiles. After changing it, run `make clean` first, or files that include it keep the old struct layout.
+
+## Batch 8: the final evaluation
+
+Batch 8 adds no C code. It measures the finished system against plain postgres_fdw in 38 configurations, checks every result for correctness, and turns the numbers into the final charts and a summary. The results, written for the presentation, are in **`docs/final/summary.md`**. The charts and tables are in `docs/final/` (copied from `results/final/`, which stays out of git).
+
+### Files
+
+| File | What it does |
+|---|---|
+| `setup/make_data.sh` | `make_data.sh S_ROWS MATCH_FRACTION uniform\|skewed` regenerates the data of both sites for one experiment, and leaves extensions, server options, user mapping and the foreign table alone. `make_data.sh 1000000 1.0 uniform` makes exactly the rows of `setup_all.sh` (we checked with a checksum of both tables). |
+| `setup/data_customers.sql` | site B: `customers` with ids 1..s_rows. The primary key is added after the rows, which is faster for 3,000,000 rows. Then `VACUUM (ANALYZE)`, so autovacuum stays quiet during measurements. |
+| `setup/data_orders.sql` | site A: 200,000 orders with keys from 1..round(s_rows / match_fraction): uniform `(random() * (max_key - 1))::int + 1`, or skewed `1 + floor(max_key * random()^3)`. Then `VACUUM (ANALYZE) orders` and `ANALYZE customers`. Our planner hook reads the **foreign** table's statistics, so they must be refreshed whenever site B's data changes. |
+| `bench/final_eval.py` | the measurements (details below). It writes one CSV per experiment: `results/final/e1.csv`, ..., `e5_100.csv`, `e5_10.csv`. |
+| `bench/final_report.py` | reads those CSVs and writes `decision_quality.csv/.md`, `headline.md` and all charts. |
+
+### How one strategy is measured (`final_eval.py`)
+
+The five strategies:
+
+| strategy | settings |
+|---|---|
+| original | `postgres_fdw.enable_semijoin = off` (the baseline) |
+| fdw_param | `enable_semijoin = off`, plus the table option `use_remote_estimate 'true'`. It is added just before the run and dropped right after, also after an error. Only for n ≤ 10,000. |
+| auto | `enable_semijoin = on`, `semijoin_force_path = auto` |
+| index / filter | `semijoin_force_path = index` / `filter` |
+
+For each one:
+
+1. **A fresh connection** to site_a, with the strategy's SET commands.
+2. **One warm-up run:** `EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) CREATE UNLOGGED TABLE final_chk_<strategy> AS <query>`. This one run does three jobs:
+   - it opens postgres_fdw's connection to site B and warms the caches;
+   - its plan gives the join type, the Foreign Scan's actual rows and our Semijoin lines (path, predicted time of both paths, and the mode, m and k actually sent);
+   - the stored table is used for the correctness check.
+   With `semijoin_verbose` on, the hook's NOTICE also gives the cost model's inputs (n_est, s_rows, rows_per_key, row_width). We pass them to `sjb_choice_report` to get **our estimated bytes**, so this formula is still computed only in costmodel.c.
+3. **Three timed runs** of the plain SELECT; we keep the median. The time is wall-clock time in Python around `cursor.execute()`, which returns when the whole result has arrived. So it covers planning, execution and sending all rows: it is **end to end**. We do not turn the rows into Python objects, which would only add Python's own time.
+4. **Correctness:** `final_chk_original EXCEPT ALL final_chk_<strategy>` and the reverse must both be empty, and the timed runs must return as many rows as the original. This is the temp-table method of `correctness_auto_one.sql`, with unlogged tables instead of temp tables because each strategy runs in its own session.
+
+### Real network bytes without sudo: `/proc/net/dev`
+
+Linux keeps a byte counter for every network interface, and any user can read it in `/proc/net/dev`:
+
+```
+    lo: 32414724263 13643705 0 0 0 0 0 0 32414724263 13643705 0 0 ...
+         ^ bytes received                ^ bytes sent
+```
+
+`read_loopback_bytes()` reads the `lo` line just before and just after each timed run, in the same Python process, and the difference is `measured_bytes`. Three details make this number mean "postgres_fdw's traffic":
+
+- **Our own client does not use `lo`.** `final_eval.py` connects to site_a through the **Unix socket** (`host=/tmp`). postgres_fdw connects from site_a to site_b by TCP to `localhost`, so it does use `lo`. The only traffic counted is A ↔ B: the filter or key list, the rows, postgres_fdw's protocol messages (START TRANSACTION, DECLARE, FETCH, CLOSE, COMMIT) and the TCP/IP headers.
+- **Received = sent.** On loopback every packet sent is also received by the same interface, so the two counters always grew by the same amount. We report one of them.
+- **Background noise.** Other programs (for example VS Code's server) also use `lo`. Before each run we read the counters 10 times, 1 second apart, while sending no query. The result was a median of 1.2 KB/s (0.5–1.9 KB/s in the E5 runs) and at most 42 KB/s. A query moves 5 KB to 119 MB, so the noise is far below 1%.
+
+Measured and estimated bytes agree within ±6% for every transfer above 1 MB. The exception is E3: the model assumes every key exists at B, and only 50% or 10% did.
+
+### Decision quality: why regret, and not only "% correct"
+
+For each configuration:
+
+- **best** = the fastest of original, index and filter (measured);
+- **regret** = auto's time / best's time. 1.00 means auto was as fast as the best strategy; 1.30 means 30% slower;
+- **correct_choice** = auto picked the strategy that was actually fastest;
+- **speedup** = original's time / auto's time.
+
+"% correct" counts every mistake the same. Most mistakes happen near the **break-even point**, where the two paths take almost the same time. There a "wrong" choice costs a few percent: E2 with n = 10,000 was wrong, but index took 34.6 ms and filter 38.7 ms, so the regret is only 1.08. A wrong choice far from the break-even point (E3 with n = 50,000: 80 ms vs 190 ms) gives a large regret. So regret measures what the mistakes actually cost, and a good cost model should keep it close to 1 even where it cannot be exactly right.
+
+Auto and the forced path run the same plan but in separate sessions, so their times differ by noise: up to ±30% for runs under 50 ms on this machine. That is why some regrets are below 1.00. `path_regret` in `decision_quality.csv` compares the forced run of the path auto chose with the best instead, which removes this noise.
+
+### E5: real network emulation with tc netem
+
+`tc qdisc add dev lo root netem rate 100mbit delay 1ms` (run by the user with sudo, and later `change ... rate 10mbit`) slows down `lo` itself: every packet waits 1 ms, and the bandwidth is capped. Before measuring, `final_eval.py --e5 <mbit>` checks with `tc qdisc show dev lo`, which needs no sudo, that netem is really active with that rate. It then tells the cost model about the network:
+
+- `postgres_fdw.semijoin_network_mbit` = the netem rate;
+- `postgres_fdw.semijoin_per_message_ms` = one round trip through postgres_fdw, **measured on this network** by `measure_fdw_round_trip()`. The same 4,950-row foreign scan runs with `fetch_size` 100 and with 10000. The rows, the bytes and site B's work are the same; only the number of round trips differs (51 vs 2 in the model's count). So one round trip = (time₁₀₀ − time₁₀₀₀₀) / 49. Result: **2.26 ms** at 100 Mbit and **2.42 ms** at 10 Mbit, against 0.062 ms on plain localhost.
+
+  A tiny one-row remote query minus its execution time at B gives 11–12 ms. That is **not** one round trip: postgres_fdw sends START TRANSACTION, DECLARE, FETCH, CLOSE and COMMIT, about 5 round trips. We record it only as a cross-check.
+
+At 10 Mbit, `auto_loopback` runs auto once more with the calibrated loopback numbers (1000 Mbit, 0.062 ms). This shows what happens when the cost model's network assumptions are wrong. The values the model was given are in every CSV row: `model_network_mbit` and `model_per_message_ms`.
+
+`final_eval.py --e5 <mbit> --simulated` is the fallback for machines without netem: measured time + measured bytes / bandwidth, labelled "simulated" in the CSV and the charts. It was not needed here.
+
+### Results in short (details: `docs/final/summary.md`)
+
+- **Correctness:** 180 of 180 strategy runs correct. After restoring the default data, `queries/correctness_auto.sql` gives 18 × (0, 0).
+- **Speedup** of auto over plain postgres_fdw: geometric mean **36×**, from 1.35× (100,000 remote rows, n = 50,000) to 2,597× (10 Mbit, n = 100). Auto was never slower.
+- **Bytes:** 96.6% less over all configurations.
+- **Correct choices:** 34 of 38 (89%). Regret: mean 1.07, median 1.00, worst 2.38.
+- **The losses:**
+  - E3, n = 50,000 (regret 1.82, 2.38): the model assumes every key exists at B, and lookups of missing keys are much cheaper;
+  - E4 skewed, n = 50,000 (1.27): clustered keys make the index path cache-friendly;
+  - E2, 100,000 rows, n = 10,000 (1.08): a near tie.
+- **E5:** with the measured network numbers, all 10 choices were right and the predictions were within 0.96–1.05 of the measured time for n ≥ 10,000. With the loopback numbers the choices were the same, but the predicted times were 10–20× too low.
+
+### Measurement notes
+
+- **The machine's state.** On the first try the Windows host was in a power-saving state. A `SELECT 1` round trip took about 175 µs instead of about 50 µs, and fetching 1M rows through postgres_fdw took 3.3 s instead of 1.4 s (the calibration's value). We measured only after the host was set to Best performance and the round trip was back at about 50 µs. **Check this before trusting any timing on WSL.**
+- **Run time:** E1, E6, E2, E3 and E4 took 6½ minutes; E5 took 13 minutes at 100 Mbit and 26 minutes at 10 Mbit. Under netem, plain postgres_fdw needs 10,001 FETCH round trips of about 2.3 ms each.
+- **The order of the experiments** keeps data regenerations to a minimum: default data (E1, E6), then 100k and 3M rows (E2), match fraction 0.5 and 0.1 (E3), skewed (E4), then the default data is restored.
+
+### How to rerun it
+
+```bash
+source setup/env.example.sh
+.venv/bin/python bench/final_eval.py          # E1, E6, E2, E3, E4; restores the data; runs correctness_auto.sql (~7 min)
+# E5, with someone who can run sudo (it slows down ALL local traffic until removed):
+sudo tc qdisc add dev lo root netem rate 100mbit delay 1ms
+.venv/bin/python bench/final_eval.py --e5 100 # ~13 min
+sudo tc qdisc change dev lo root netem rate 10mbit delay 1ms
+.venv/bin/python bench/final_eval.py --e5 10  # ~26 min
+sudo tc qdisc del dev lo root
+.venv/bin/python bench/final_report.py        # table, headline, charts in results/final/
+cp results/final/*.png results/final/*.md results/final/*.csv docs/final/
+```
+
+To follow a run: `tail -f results/final/run_*.log` (if you redirect the output there, as we did). Each line shows one strategy: median time, measured bytes, rows sent by B, join type, path/mode and `correct=`.
