@@ -286,3 +286,34 @@ SELECT sjb_plan_choice(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100) AS d
  filter        | index
 (1 row)
 
+-- Step 21 (Batch 7): expected rows back and predicted time per path, the
+-- same numbers as the report of Step 15 (same arguments). Index and EXACT
+-- send back exactly M = 10000 rows; Bloom adds its false positives; the
+-- 'auto' values equal the winner's. An unknown path is an error.
+SELECT path,
+       round(sjb_expected_remote_rows(10000, 1e6, 1, 32, 1000, 150, 2, 0.06, 0.5, 0.25, 100, 1048576, path)::numeric, 1) AS rows_back,
+       round(sjb_predicted_ms(10000, 1e6, 1, 32, 1000, 150, 2, 0.06, 0.5, 0.25, 100, 1048576, path)::numeric, 3) AS total_ms
+FROM unnest(ARRAY['index', 'filter', 'auto']) AS path;
+  path  | rows_back | total_ms 
+--------+-----------+----------
+ index  |   10000.0 |   34.180
+ filter |   10163.2 |  166.727
+ auto   |   10000.0 |   34.180
+(3 rows)
+
+SELECT sjb_expected_remote_rows(10000, 1e6, 1, 32, 1000, 150, 2, 0.06, 0.5, 0.25, 100, 1048576, 'nested');
+ERROR:  sjbloom: path must be 'index', 'filter' or 'auto', got 'nested'
+-- Step 22 (Batch 7): wire_factor, the last argument of the report
+-- functions. 2 = the filter travels as hex text (default), 1 = in binary.
+-- On a 1 Mbit/s network with 200000 keys the filter path's bytes A->B
+-- halve, so its predicted time drops; the index path does not change.
+SELECT wire_factor,
+       round(sjb_predicted_ms(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100, 1048576, 'index', wire_factor)::numeric, 1) AS index_ms,
+       round(sjb_predicted_ms(200000, 1e6, 1, 32, 1, 150, 2, 0.06, 0.5, 0.25, 100, 1048576, 'filter', wire_factor)::numeric, 1) AS filter_ms
+FROM unnest(ARRAY[2.0, 1.0]::float8[]) AS wire_factor;
+ wire_factor | index_ms | filter_ms 
+-------------+----------+-----------
+           2 |  63020.1 |   57040.1
+           1 |  63020.1 |   54618.7
+(2 rows)
+

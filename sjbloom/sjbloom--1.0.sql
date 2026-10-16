@@ -157,7 +157,9 @@ LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
  * arguments are as for sjb_build_auto. max_filter_bytes (Batch 6b) is
  * the largest BLOOM/EXACT filter allowed, as for sjb_build_auto; the
  * planner hook passes postgres_fdw.semijoin_max_filter_kb * 1024 to both,
- * so the two decisions use the same limit. wire_factor is 2 (hex text).
+ * so the two decisions use the same limit. wire_factor (Batch 7) is 2
+ * when postgres_fdw sends the filter as hex text (the default) and 1 when
+ * it sends it in binary (postgres_fdw.semijoin_binary_filter = on).
  */
 CREATE FUNCTION sjb_choice_report(n float8,
                                   s_rows float8,
@@ -170,7 +172,8 @@ CREATE FUNCTION sjb_choice_report(n float8,
                                   per_row_us float8 DEFAULT 0.54819,
                                   t_build_us float8 DEFAULT 0.245,
                                   fetch_size int4 DEFAULT 100,
-                                  max_filter_bytes int8 DEFAULT 1048576)
+                                  max_filter_bytes int8 DEFAULT 1048576,
+                                  wire_factor float8 DEFAULT 2)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_choice_report'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -191,7 +194,56 @@ CREATE FUNCTION sjb_plan_choice(n float8,
                                 per_row_us float8 DEFAULT 0.54819,
                                 t_build_us float8 DEFAULT 0.245,
                                 fetch_size int4 DEFAULT 100,
-                                max_filter_bytes int8 DEFAULT 1048576)
+                                max_filter_bytes int8 DEFAULT 1048576,
+                                wire_factor float8 DEFAULT 2)
 RETURNS text
 AS 'MODULE_PATHNAME', 'sjb_plan_choice'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+/*
+ * Step 8: sjb_expected_remote_rows and sjb_predicted_ms (Batch 7). The
+ * same 12 arguments as sjb_plan_choice, plus a path: 'index', 'filter'
+ * (with the mode the cost model would pick) or 'auto' (the path the cost
+ * model picks).
+ *   sjb_expected_remote_rows: rows site B sends back on that path
+ *     (index: M; filter: M + false positives for BLOOM, M for EXACT, all
+ *     of S for PASS). postgres_fdw's planner hook uses it as the row
+ *     estimate of the rewritten foreign scan.
+ *   sjb_predicted_ms: the predicted total time of that path in ms (the
+ *     total_ms column of sjb_choice_report), shown by EXPLAIN.
+ */
+CREATE FUNCTION sjb_expected_remote_rows(n float8,
+                                         s_rows float8,
+                                         rows_per_key float8,
+                                         row_width float8,
+                                         network_mbit float8,
+                                         t_check_ns float8,
+                                         t_lookup_us float8,
+                                         per_message_ms float8 DEFAULT 0.06194,
+                                         per_row_us float8 DEFAULT 0.54819,
+                                         t_build_us float8 DEFAULT 0.245,
+                                         fetch_size int4 DEFAULT 100,
+                                         max_filter_bytes int8 DEFAULT 1048576,
+                                         path text DEFAULT 'auto',
+                                         wire_factor float8 DEFAULT 2)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'sjb_expected_remote_rows'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION sjb_predicted_ms(n float8,
+                                 s_rows float8,
+                                 rows_per_key float8,
+                                 row_width float8,
+                                 network_mbit float8,
+                                 t_check_ns float8,
+                                 t_lookup_us float8,
+                                 per_message_ms float8 DEFAULT 0.06194,
+                                 per_row_us float8 DEFAULT 0.54819,
+                                 t_build_us float8 DEFAULT 0.245,
+                                 fetch_size int4 DEFAULT 100,
+                                 max_filter_bytes int8 DEFAULT 1048576,
+                                 path text DEFAULT 'auto',
+                                 wire_factor float8 DEFAULT 2)
+RETURNS float8
+AS 'MODULE_PATHNAME', 'sjb_predicted_ms'
 LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;

@@ -20,10 +20,14 @@
  *   sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
  *                     t_check_ns, t_lookup_us, per_message_ms,
  *                     per_row_us, t_build_us, fetch_size,
- *                     max_filter_bytes) RETURNS text
+ *                     max_filter_bytes, wire_factor) RETURNS text
  *       A readable report of the cost model's estimates.       (Batch 5)
  *   sjb_plan_choice(same arguments) RETURNS text
  *       'index' or 'filter': which path the cost model picks.  (Batch 5)
+ *   sjb_expected_remote_rows(same arguments, path) RETURNS float8
+ *       rows site B is expected to send back on that path.     (Batch 7)
+ *   sjb_predicted_ms(same arguments, path) RETURNS float8
+ *       predicted total time of that path in ms.               (Batch 7)
  *
  * This file turns SQL values (arrays, bytea, float8) into plain C data and
  * back. The Bloom filter logic is in bloom.c, the cost model in
@@ -665,18 +669,22 @@ check_cost_inputs(const SjbCostInputs *inputs)
  * What it does: reads the 12 arguments of sjb_choice_report and
  * sjb_plan_choice (n, s_rows, rows_per_key, row_width, network_mbit,
  * t_check_ns, t_lookup_us, per_message_ms, per_row_us, t_build_us,
- * fetch_size, max_filter_bytes) into an SjbCostInputs, uses the default
- * wire_factor and key text length, and checks them.
+ * fetch_size, max_filter_bytes) and the wire_factor (Batch 7) into an
+ * SjbCostInputs, uses the default key text length, and checks them.
  *
  * Inputs:  fcinfo - the function call info of the SQL function (it holds
  *                   the arguments; the PG_GETARG_ macros read from it)
+ *          wire_factor_argument - the argument number of wire_factor: 12
+ *                   for sjb_choice_report / sjb_plan_choice, 13 for the
+ *                   functions that take a path first
  * Output:  *inputs is filled in
  *
  * Why it exists: both SQL functions take the same arguments, and they
  * must give the cost model exactly the same inputs.
  */
 static void
-read_report_arguments(FunctionCallInfo fcinfo, SjbCostInputs *inputs)
+read_report_arguments(FunctionCallInfo fcinfo, SjbCostInputs *inputs,
+					  int wire_factor_argument)
 {
 	/* PG_GETARG_FLOAT8(i) reads argument number i as a C double. */
 	inputs->num_keys = PG_GETARG_FLOAT8(0);
@@ -696,7 +704,11 @@ read_report_arguments(FunctionCallInfo fcinfo, SjbCostInputs *inputs)
 	 * time decision and the run time filter agree (SQL default: 1 MB).
 	 */
 	inputs->max_filter_bytes = (double) PG_GETARG_INT64(11);
-	inputs->wire_factor = SJB_DEFAULT_WIRE_FACTOR;
+	/*
+	 * Batch 7: 2 when postgres_fdw sends the filter as hex text (the
+	 * default), 1 when it sends it in binary (semijoin_binary_filter).
+	 */
+	inputs->wire_factor = PG_GETARG_FLOAT8(wire_factor_argument);
 	inputs->key_text_len = SJB_DEFAULT_KEY_TEXT_LEN;
 
 	check_cost_inputs(inputs);
@@ -1070,7 +1082,7 @@ PG_FUNCTION_INFO_V1(sjb_choice_report);
  * sjb_choice_report(n, s_rows, rows_per_key, row_width, network_mbit,
  *                   t_check_ns, t_lookup_us, per_message_ms, per_row_us,
  *                   t_build_us float8, fetch_size int4,
- *                   max_filter_bytes int8) RETURNS text
+ *                   max_filter_bytes int8, wire_factor float8) RETURNS text
  *
  * What it does: runs the cost model (sjb_estimate_all, the same code
  * sjb_build_auto uses) and returns a readable multi-line report: one line
@@ -1082,8 +1094,8 @@ PG_FUNCTION_INFO_V1(sjb_choice_report);
  * Inputs:  n            - number of distinct keys at site A
  *          s_rows .. t_check_ns - as for sjb_build_auto
  *          t_lookup_us  - time per key of the index path
- *          per_message_ms .. fetch_size, max_filter_bytes - as for
- *                         sjb_build_auto (wire_factor = 2, the default)
+ *          per_message_ms .. fetch_size, max_filter_bytes, wire_factor
+ *                         - as for sjb_build_auto
  * Output:  the report as text
  *
  * Why it exists: to explain and present the model's decisions, and for
@@ -1097,7 +1109,7 @@ sjb_choice_report(PG_FUNCTION_ARGS)
 	const SjbCostEstimate *best_filter;
 	StringInfoData report;
 
-	read_report_arguments(fcinfo, &inputs);
+	read_report_arguments(fcinfo, &inputs, 12);
 	sjb_estimate_all(&inputs, &choice);
 	best_filter = sjb_estimate_for_mode(&choice, choice.best_filter_mode);
 
@@ -1154,7 +1166,7 @@ sjb_choice_report(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(sjb_plan_choice);
 
 /*
- * sjb_plan_choice(same 12 arguments as sjb_choice_report) RETURNS text
+ * sjb_plan_choice(same 13 arguments as sjb_choice_report) RETURNS text
  *
  * What it does: returns 'index' if the index path is estimated to be
  * faster (or equal), otherwise 'filter'.
@@ -1171,10 +1183,118 @@ sjb_plan_choice(PG_FUNCTION_ARGS)
 	SjbCostInputs inputs;
 	SjbChoice	choice;
 
-	read_report_arguments(fcinfo, &inputs);
+	read_report_arguments(fcinfo, &inputs, 12);
 	sjb_estimate_all(&inputs, &choice);
 
 	if (choice.index_path_wins)
 		PG_RETURN_TEXT_P(cstring_to_text("index"));
 	PG_RETURN_TEXT_P(cstring_to_text("filter"));
+}
+
+
+/*
+ * estimate_for_path
+ *
+ * What it does: returns the estimate that belongs to a path name:
+ *   'index'  - the index path
+ *   'filter' - the filter path with the mode the cost model would pick
+ *   'auto'   - whichever of the two the cost model picks
+ *
+ * Inputs:  choice - the result of sjb_estimate_all; path - the path name
+ * Output:  a pointer to that estimate (inside *choice); raises an error
+ *          for an unknown name
+ *
+ * Why it exists: sjb_expected_remote_rows and sjb_predicted_ms (Batch 7)
+ * both need "the estimate of this path", and it must be found the same
+ * way in both.
+ */
+static const SjbCostEstimate *
+estimate_for_path(const SjbChoice *choice, const char *path)
+{
+	const SjbCostEstimate *best_filter;
+
+	best_filter = sjb_estimate_for_mode(choice, choice->best_filter_mode);
+
+	if (strcmp(path, "index") == 0)
+		return &choice->index_path;
+	if (strcmp(path, "filter") == 0)
+		return best_filter;
+	if (strcmp(path, "auto") == 0)
+	{
+		if (choice->index_path_wins)
+			return &choice->index_path;
+		return best_filter;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("sjbloom: path must be 'index', 'filter' or 'auto', got '%s'",
+					path)));
+	return NULL;				/* not reached; keeps the compiler quiet */
+}
+
+
+PG_FUNCTION_INFO_V1(sjb_expected_remote_rows);
+
+/*
+ * sjb_expected_remote_rows(the first 12 arguments of sjb_plan_choice,
+ *                          path text, wire_factor float8) RETURNS float8
+ *
+ * What it does: the number of rows site B is expected to send back on
+ * the given path: M (the matching rows) on the index path, and on the
+ * filter path the rows back of the mode the cost model would pick (for
+ * BLOOM: M plus the expected false positives; for PASS: all of S).
+ *
+ * Inputs:  the 12 cost model arguments; path - 'index', 'filter' or 'auto'
+ * Output:  the expected number of rows
+ *
+ * Why it exists: Batch 7's planner hook gives this number to
+ * postgres_fdw's own row estimate, so the planner stops guessing ~10 rows
+ * for the rewritten foreign scan. It comes from the same estimate as the
+ * path decision (sjb_estimate_all), so the logic lives in one place.
+ */
+Datum
+sjb_expected_remote_rows(PG_FUNCTION_ARGS)
+{
+	SjbCostInputs inputs;
+	SjbChoice	choice;
+	char	   *path;
+
+	read_report_arguments(fcinfo, &inputs, 13);
+	sjb_estimate_all(&inputs, &choice);
+
+	/* PG_GETARG_TEXT_PP reads a text argument; text_to_cstring makes a C string */
+	path = text_to_cstring(PG_GETARG_TEXT_PP(12));
+	PG_RETURN_FLOAT8(estimate_for_path(&choice, path)->rows_back);
+}
+
+
+PG_FUNCTION_INFO_V1(sjb_predicted_ms);
+
+/*
+ * sjb_predicted_ms(the first 12 arguments of sjb_plan_choice, path text,
+ *                  wire_factor float8) RETURNS float8
+ *
+ * What it does: the predicted total time in ms of the given path (for the
+ * filter path: with the mode the cost model would pick). These are the
+ * same numbers as the total_ms column of sjb_choice_report.
+ *
+ * Inputs:  the 12 cost model arguments; path - 'index', 'filter' or 'auto'
+ * Output:  the predicted time in milliseconds
+ *
+ * Why it exists: Batch 7 shows both predicted times in EXPLAIN, and the
+ * planner hook should not have to read them out of the report's text.
+ */
+Datum
+sjb_predicted_ms(PG_FUNCTION_ARGS)
+{
+	SjbCostInputs inputs;
+	SjbChoice	choice;
+	char	   *path;
+
+	read_report_arguments(fcinfo, &inputs, 13);
+	sjb_estimate_all(&inputs, &choice);
+
+	path = text_to_cstring(PG_GETARG_TEXT_PP(12));
+	PG_RETURN_FLOAT8(estimate_for_path(&choice, path)->total_seconds * 1000.0);
 }

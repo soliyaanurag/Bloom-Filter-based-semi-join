@@ -1276,3 +1276,148 @@ psql -X -d site_a -f queries/correctness_auto.sql                     # 18 x (0,
 ```
 
 The patch was re-exported (`patches/postgres_fdw-semijoin.patch`, base `a85b5523e6`). `git apply --check` against plain `REL_18_6` again reports no errors.
+
+## Where the code lives (Batch 6 and later)
+
+- **postgres_fdw changes:** `~/postgres/postgresql/contrib/postgres_fdw`, on branch **`cs631-semijoin`** of the PostgreSQL source tree, which branches off at base commit `a85b5523e6`. The changes are **only visible on that branch**. On `REL_18_STABLE` the same folder holds the original code. The changed files are `semijoin.c` (new), `option.c`, `postgres_fdw.c`, `postgres_fdw.h`, `Makefile` and `meson.build`, plus the test files `sql/semijoin.sql` and `expected/semijoin.out`.
+- **The installed library:** `~/postgres/postgresql/install/lib/postgres_fdw.so`. It is built from that branch. The original library is backed up at **`~/postgres_fdw.so.orig`**.
+- **The project repo** (this repository) holds the whole change as one file, `patches/postgres_fdw-semijoin.patch`. The sjbloom functions it calls are in `sjbloom/`.
+
+View the code:
+
+```bash
+cd ~/postgres/postgresql
+git switch cs631-semijoin                                   # the branch with our changes
+git log --oneline a85b5523e6..cs631-semijoin                # our commits
+git diff a85b5523e6..cs631-semijoin --stat -- contrib/postgres_fdw
+git diff a85b5523e6..cs631-semijoin -- contrib/postgres_fdw  # the full change (= the patch file)
+less contrib/postgres_fdw/semijoin.c
+```
+
+Restore the original postgres_fdw:
+
+```bash
+# quickest: copy the backup back (the server loads it in new sessions)
+cp ~/postgres_fdw.so.orig ~/postgres/postgresql/install/lib/postgres_fdw.so
+
+# or rebuild the original from source
+cd ~/postgres/postgresql && git switch REL_18_STABLE
+make -C contrib/postgres_fdw clean && make -C contrib/postgres_fdw && make -C contrib/postgres_fdw install
+```
+
+The original postgres_fdw does not know the option `semijoin_filter`, so remove it as well: `psql -d site_a -c "ALTER SERVER site_b_srv OPTIONS (DROP semijoin_filter)"`. To go back to our version, `git switch cs631-semijoin` and rebuild and install.
+
+## Batch 7: row estimates, EXPLAIN output, binary filter, regression test
+
+Batch 6 rewrote the query, but the planner still did not know what the rewrite does. It guessed **10 rows** for the Foreign Scan with `customer_id = ANY ($1)`, and 1/3 of the table (333,333) for `sjb_contains($1, customer_id)`. At n ≤ 1000 it therefore picked a Nested Loop with a Join Filter. Batch 7 passes the cost model's knowledge on to the planner and to EXPLAIN. It also adds an optional binary filter and our own regression test. Commit `2c34d26d89` on `cs631-semijoin`.
+
+### How the hint travels: from the hook to the row estimate and to EXPLAIN
+
+```
+pgfdw_semijoin_planner (our hook)
+ |  1. rewrite the query (Batch 6), then fill_hint():
+ |       expected_rows = sjb_expected_remote_rows(..., path)
+ |       index_ms, filter_ms = sjb_predicted_ms(..., 'index' / 'filter')
+ |  2. pgfdw_semijoin_hint = &my_hint        (only now)
+ |  3. standard_planner(query)
+ |       |-- postgresGetForeignRelSize
+ |       |     set_baserel_size_estimates()   -> planner guess: 10 rows
+ |       |     pgfdw_apply_semijoin_hint()     -> baserel->rows = expected rows
+ |       |     estimate_path_cost_size()       -> fpinfo->rows, retrieved_rows, costs
+ |       |                                        all follow from baserel->rows
+ |       |-- join planning: now sees 952 rows, picks a Hash Join
+ |       '-- postgresGetForeignPlan
+ |             pgfdw_semijoin_plan_info()     -> copies path, n_est, both times and
+ |                                               the parameter number into the plan
+ |                                               (fdw_private position 4)
+ |  4. PG_FINALLY: pgfdw_semijoin_hint = previous value (NULL)
+ v
+executor:  postgresBeginForeignScan  reads fdw_private[4]
+           create_cursor             after the parameters are computed:
+                                     pgfdw_semijoin_decode_param() reads the
+                                     filter header / counts the keys sent
+EXPLAIN:   postgresExplainForeignScan -> pgfdw_semijoin_explain()
+```
+
+- **The hint** (`SemijoinHint` in postgres_fdw.h) holds the foreign table's OID, its join column, sjb_contains's OID, the path, n_est, the expected rows and both predicted times. The global pointer `pgfdw_semijoin_hint` points to it **only while that one query is planned**. The hook sets it just before calling the planner and puts the old value back in `PG_FINALLY`, also after an error. A query planned inside another one, or the next query, never sees it. A query that is not rewritten sets it to NULL.
+- **The row estimate.** `pgfdw_apply_semijoin_hint` is one new line in `postgresGetForeignRelSize`, right after PostgreSQL's own estimate. It does something only if the hint's OID matches, `root->query_level == 1` (the top-level query, never a subquery), and our own condition is found among the table's conditions. It sets `baserel->rows = expected_rows × selectivity of the other conditions`. For example, `c.city = 'X'` still lowers the estimate. postgres_fdw derives everything else (fpinfo->rows, retrieved_rows, per-row costs) from baserel->rows. The `use_remote_estimate` branch is not changed. With verbose on, it prints `semijoin: foreign scan rows 10 -> 952`.
+- **sjbloom** has two new functions with the same 12 arguments as `sjb_plan_choice` plus a path: `sjb_expected_remote_rows` (index: M; filter: the rows back of the mode the model would pick) and `sjb_predicted_ms`. Both use `sjb_estimate_all`, so the logic stays in one place (regression Step 21).
+- **The plan.** EXPLAIN runs after planning, when the hint is gone. So `postgresGetForeignPlan` copies the values into the ForeignScan's `fdw_private` as a new item, `FdwScanPrivateSemijoin` (position 4). A plain table scan has no Relations item at position 3, so a NULL placeholder goes there and no existing position moves. EXPLAIN used to treat "more than 3 items" as a join. That one line now also checks that position 3 is not NULL.
+- **What was sent.** The parameter values are built in short-lived memory, so `create_cursor` decodes ours right away, into a fixed-size buffer in `PgFdwScanState`. For a filter it reads the 24-byte header (version, mode, k, nkeys, m) from the hex text with memcpy. For a key list it counts the elements of `{...}`. If anything looks wrong it shows "unavailable"; it never raises an error.
+
+### Results: row estimate before and after
+
+| n | join before | join after | Foreign Scan est. before → after | actual rows | time before | time after |
+|---|---|---|---|---|---|---|
+| 100 | Nested Loop | Nested Loop | 10 → 95 | 100 | 2.2 ms | 2.5 ms |
+| 1000 | Nested Loop | **Hash Join** | 10 → 952 | 999 | **117.4 ms** | **6.7 ms** |
+| 10000 | Hash Join | Hash Join | 10 → 10300 | 9955 | 55.2 ms | 60.1 ms |
+| 100000 | Hash Join | Hash Join | 333333 → 96807 | 96509 | 504 ms | 515–539 ms (5 runs; same plan) |
+
+At n = 100 the planner still picks a Nested Loop. The reason is the **join** estimate (rows=1 vs 100), which comes from PostgreSQL's own join selectivity (n_distinct of customers.customer_id = 1M). With `enable_nestloop = off` a Hash Join is just as fast there (about 5 ms each), so it does no harm. Changing join estimates would need another hook; it is not done.
+
+**Known limitation:** the path decision (index vs filter) ignores extra conditions on the foreign table alone, such as `c.city = 'X'`. Only the row estimate accounts for them. Both paths are affected about equally, so the choice rarely changes.
+
+### EXPLAIN output
+
+Plain EXPLAIN, index path (n = 1000):
+
+```
+   ->  Foreign Scan on customers c  (cost=100.00..39956.92 rows=952 width=15)
+         Semijoin Path: index
+         Semijoin Estimated Keys: 952
+         Semijoin Predicted Time: index=6.071 ms filter=159.934 ms
+```
+
+EXPLAIN ANALYZE adds what was really sent:
+
+```
+         Remote SQL: SELECT customer_id, name FROM public.customers WHERE ((customer_id = ANY ($1::integer[])))
+         Semijoin Keys Sent: 999 bytes_sent=6887
+
+         Remote SQL: SELECT customer_id, name FROM public.customers WHERE (public.sjb_contains($1::bytea, customer_id))
+         Semijoin Path: filter
+         Semijoin Estimated Keys: 95302
+         Semijoin Predicted Time: index=598.923 ms filter=322.786 ms
+         Semijoin Filter: mode=bloom keys=95017 m=1266314 k=9 bytes_sent=316630
+```
+
+The filter really holds 95,017 keys (the true number; the estimate was 95,302). Its size checks out: 2 · (24 + ⌈1266314/8⌉) + 2 = 316,630 hex characters.
+
+### Binary filter (`postgres_fdw.semijoin_binary_filter`, default off)
+
+postgres_fdw normally sends every parameter as text, so a bytea filter travels as hex (2 characters per byte). With this setting on, every **bytea** parameter of a foreign scan is sent in binary instead: format code 1, the raw bytes and their length, passed to `PQsendQueryParams` through the new arrays `param_formats` and `param_lengths` in `PgFdwScanState`. Everything else is unchanged; with the setting off both arrays are NULL, as before. The hook then passes `wire_factor = 1` to the cost functions and to `sjb_build_auto`. All four report-style sjbloom functions have a new last argument, `wire_factor float8 DEFAULT 2` (regression Step 22).
+
+At n = 100000: hex text 316,630 bytes, binary **175,447 bytes** (55%). It is not exactly half because with wire_factor 1 the cost model picks a slightly larger Bloom filter (m = 1,403,381, k = 10, fewer false positives). The results are identical (EXCEPT ALL 0/0), and postgres_fdw's own suite passes with the setting at its default.
+
+### Our regression test: `contrib/postgres_fdw/sql/semijoin.sql`
+
+A loopback server to the test database plays site B (the same style as postgres_fdw's own test). It uses 2,000 "remote" customers and 300 local orders, some with NULL keys and some with keys that have no customer. Step 0 SETs every cost constant and the network speed to fixed values, so the expected output never depends on a future recalibration. The test covers:
+- the rewrite on and off in `EXPLAIN (VERBOSE, COSTS OFF)`;
+- `force_path` index and filter;
+- EXPLAIN ANALYZE of what was sent, text and binary, filtered to the Foreign Scan lines so memory sizes cannot change the output;
+- correctness with the temp-table method (`sj_compare`) for auto, index, filter and binary;
+- NULL-only keys and an empty local result;
+- GROUP BY;
+- the negative cases: LEFT JOIN, `random()`, `semijoin_filter = false` on the table, and an invalid option value.
+
+It needs sjbloom, which plain PostgreSQL does not have, so it is **not** in the default `REGRESS` list (a comment in the Makefile says so). Run it explicitly:
+
+```bash
+make -C ~/postgres/postgresql/contrib/postgres_fdw installcheck REGRESS=semijoin
+```
+
+### How to test it
+
+```bash
+source setup/env.example.sh
+make -C sjbloom && make -C sjbloom install
+for db in site_a site_b; do psql -X -d $db -c "DROP EXTENSION sjbloom CASCADE" -c "CREATE EXTENSION sjbloom"; done
+make -C sjbloom installcheck                                                         # ok
+make -C ~/postgres/postgresql/contrib/postgres_fdw clean all install                 # full rebuild: the header changed
+make -C ~/postgres/postgresql/contrib/postgres_fdw installcheck                      # postgres_fdw's own tests: ok
+make -C ~/postgres/postgresql/contrib/postgres_fdw installcheck REGRESS=semijoin     # our test: ok
+psql -X -d site_a -f queries/correctness_auto.sql                                    # 18 x (0, 0)
+```
+
+Note: like sjbloom's header, `postgres_fdw.h` is not tracked by this tree's Makefiles. After changing it, run `make clean` first, or files that include it keep the old struct layout.

@@ -1,5 +1,5 @@
 diff --git a/contrib/postgres_fdw/Makefile b/contrib/postgres_fdw/Makefile
-index 8eaf4d263b..af714b2d80 100644
+index 8eaf4d263b..b9bec7a11e 100644
 --- a/contrib/postgres_fdw/Makefile
 +++ b/contrib/postgres_fdw/Makefile
 @@ -7,6 +7,7 @@ OBJS = \
@@ -10,6 +10,501 @@ index 8eaf4d263b..af714b2d80 100644
  	shippable.o
  PGFILEDESC = "postgres_fdw - foreign data wrapper for PostgreSQL"
  
+@@ -17,6 +18,9 @@ EXTENSION = postgres_fdw
+ DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql postgres_fdw--1.1--1.2.sql
+ 
+ REGRESS = postgres_fdw query_cancel
++# CS631: sql/semijoin.sql tests the semijoin rewrite. It needs the sjbloom
++# extension, which plain PostgreSQL does not have, so it is not in REGRESS.
++# Run it with:  make installcheck REGRESS=semijoin
+ ISOLATION = eval_plan_qual
+ ISOLATION_OPTS = --load-extension=postgres_fdw
+ TAP_TESTS = 1
+diff --git a/contrib/postgres_fdw/expected/semijoin.out b/contrib/postgres_fdw/expected/semijoin.out
+new file mode 100644
+index 0000000000..9011d324d0
+--- /dev/null
++++ b/contrib/postgres_fdw/expected/semijoin.out
+@@ -0,0 +1,479 @@
++-- ===================================================================
++-- CS631: tests of the automatic semijoin rewrite (semijoin.c).
++--
++-- Needs the sjbloom extension (CS631 project), which plain PostgreSQL does
++-- not have, so this test is NOT in the default REGRESS list. Run it with:
++--     make installcheck REGRESS=semijoin
++--
++-- A loopback server plays "site B": the "remote" table lives in schema
++-- sj_remote of this same database, and ft_customers points to it.
++-- ===================================================================
++-- ===================================================================
++-- Step 0: fixed values for every cost constant and the network speed,
++-- so the expected output never depends on a future recalibration (the
++-- values are the current defaults, from results/calibration.json). They
++-- are set before postgres_fdw is loaded; it takes them over when it
++-- defines its settings.
++-- ===================================================================
++SET postgres_fdw.semijoin_network_mbit = 1000;
++SET postgres_fdw.semijoin_t_check_ns = 158.19;
++SET postgres_fdw.semijoin_t_lookup_us = 4.7956;
++SET postgres_fdw.semijoin_per_message_ms = 0.06194;
++SET postgres_fdw.semijoin_per_row_us = 0.54819;
++SET postgres_fdw.semijoin_t_build_us = 0.245;
++SET postgres_fdw.semijoin_max_filter_kb = 1024;
++SET postgres_fdw.semijoin_binary_filter = off;
++-- ===================================================================
++-- Step 1: extensions, loopback server, user mapping
++-- ===================================================================
++CREATE EXTENSION postgres_fdw;
++CREATE EXTENSION sjbloom;
++-- make sure our planner hook is installed in this session
++LOAD 'postgres_fdw';
++DO $d$
++    BEGIN
++        EXECUTE $$CREATE SERVER sj_loopback FOREIGN DATA WRAPPER postgres_fdw
++            OPTIONS (dbname '$$||current_database()||$$',
++                     port '$$||current_setting('port')||$$'
++            )$$;
++    END;
++$d$;
++CREATE USER MAPPING FOR CURRENT_USER SERVER sj_loopback;
++-- the filter functions may be sent to the "remote" side, and the rewrite
++-- is opted in for this server
++ALTER SERVER sj_loopback OPTIONS (ADD extensions 'sjbloom', ADD semijoin_filter 'true');
++-- ===================================================================
++-- Step 2: small tables. Customers 1..2000 at the "remote" side; 300
++-- orders whose customer_id is sometimes NULL (every 10th order) and
++-- sometimes a customer that does not exist (2001..2500).
++-- ===================================================================
++CREATE SCHEMA sj_remote;
++CREATE TABLE sj_remote.customers (
++    id   int PRIMARY KEY,
++    name text,
++    city text
++);
++INSERT INTO sj_remote.customers
++SELECT g, 'customer ' || g, 'city ' || (g % 10)
++FROM generate_series(1, 2000) AS g;
++CREATE FOREIGN TABLE ft_customers (id int, name text, city text)
++    SERVER sj_loopback OPTIONS (schema_name 'sj_remote', table_name 'customers');
++CREATE TABLE orders_l (
++    order_id    int PRIMARY KEY,
++    customer_id int,
++    amount      int
++);
++INSERT INTO orders_l
++SELECT g,
++       CASE WHEN g % 10 = 0 THEN NULL ELSE (g * 37) % 2500 + 1 END,
++       g % 97
++FROM generate_series(1, 300) AS g;
++-- the hook needs statistics of both tables
++ANALYZE sj_remote.customers;
++ANALYZE ft_customers;
++ANALYZE orders_l;
++-- ===================================================================
++-- Step 3: a helper for the correctness checks. It runs a query into a
++-- temp table with the rewrite off and again with it on, and compares
++-- the two with EXCEPT ALL in both directions (duplicates count).
++-- (A single "query EXCEPT ALL query" is a set operation, which the
++-- hook never rewrites.) Both counts must be 0.
++-- ===================================================================
++CREATE FUNCTION sj_compare(query text,
++                           OUT on_rows bigint,
++                           OUT off_except_on bigint,
++                           OUT on_except_off bigint)
++LANGUAGE plpgsql AS $$
++BEGIN
++    SET LOCAL postgres_fdw.enable_semijoin = off;
++    EXECUTE 'CREATE TEMP TABLE sj_off AS ' || query;
++    SET LOCAL postgres_fdw.enable_semijoin = on;
++    EXECUTE 'CREATE TEMP TABLE sj_on AS ' || query;
++    SET LOCAL postgres_fdw.enable_semijoin = off;
++    SELECT count(*) INTO on_rows FROM sj_on;
++    SELECT count(*) INTO off_except_on
++        FROM (SELECT * FROM sj_off EXCEPT ALL SELECT * FROM sj_on) AS d;
++    SELECT count(*) INTO on_except_off
++        FROM (SELECT * FROM sj_on EXCEPT ALL SELECT * FROM sj_off) AS d;
++    DROP TABLE sj_off, sj_on;
++END;
++$$;
++-- A helper for EXPLAIN ANALYZE: shows only the lines of the foreign scan
++-- that matter here, so memory sizes and the like cannot change the output.
++CREATE FUNCTION sj_explain_analyze(query text) RETURNS SETOF text
++LANGUAGE plpgsql AS $$
++DECLARE
++    line text;
++BEGIN
++    FOR line IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query
++    LOOP
++        IF line ~ '(Foreign Scan|Remote SQL|Semijoin)' THEN
++            RETURN NEXT line;
++        END IF;
++    END LOOP;
++END;
++$$;
++-- ===================================================================
++-- Step 4: the rewrite is visible in EXPLAIN, and can be turned off
++-- ===================================================================
++-- the cost model's choice (auto)
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++                                           QUERY PLAN                                            
++-------------------------------------------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   InitPlan 1
++     ->  Aggregate
++           Output: array_agg(DISTINCT o_1.customer_id)
++           ->  Sort
++                 Output: o_1.customer_id
++                 Sort Key: o_1.customer_id
++                 ->  Seq Scan on public.orders_l o_1
++                       Output: o_1.customer_id
++                       Filter: ((o_1.customer_id IS NOT NULL) AND (o_1.order_id <= 50))
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE ((id = ANY ($1::integer[])))
++         Semijoin Path: index
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.491 ms
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(23 rows)
++
++-- off: the original plan, all customers are fetched
++SET postgres_fdw.enable_semijoin = off;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++                          QUERY PLAN                          
++--------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(11 rows)
++
++RESET postgres_fdw.enable_semijoin;
++-- ===================================================================
++-- Step 5: force_path index and filter
++-- ===================================================================
++SET postgres_fdw.semijoin_force_path = index;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++                                           QUERY PLAN                                            
++-------------------------------------------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   InitPlan 1
++     ->  Aggregate
++           Output: array_agg(DISTINCT o_1.customer_id)
++           ->  Sort
++                 Output: o_1.customer_id
++                 Sort Key: o_1.customer_id
++                 ->  Seq Scan on public.orders_l o_1
++                       Output: o_1.customer_id
++                       Filter: ((o_1.customer_id IS NOT NULL) AND (o_1.order_id <= 50))
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE ((id = ANY ($1::integer[])))
++         Semijoin Path: index
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.491 ms
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(23 rows)
++
++SET postgres_fdw.semijoin_force_path = filter;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++                                                                                                                                                           QUERY PLAN                                                                                                                                                            
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   InitPlan 1
++     ->  Aggregate
++           Output: sjb_build_auto(array_agg(o_1.customer_id), '2000'::double precision, '1'::double precision, '35'::double precision, '1000'::double precision, '158.19'::double precision, '1048576'::bigint, '2'::double precision, '0.06194'::double precision, '0.54819'::double precision, '0.245'::double precision, 100)
++           ->  Seq Scan on public.orders_l o_1
++                 Output: o_1.order_id, o_1.customer_id, o_1.amount
++                 Filter: ((o_1.customer_id IS NOT NULL) AND (o_1.order_id <= 50))
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE (public.sjb_contains($1::bytea, id))
++         Semijoin Path: filter
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.491 ms
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(20 rows)
++
++-- EXPLAIN ANALYZE shows what was really sent
++SET postgres_fdw.semijoin_force_path = index;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++                                       sj_explain_analyze                                        
++-------------------------------------------------------------------------------------------------
++   ->  Foreign Scan on public.ft_customers c (actual rows=45.00 loops=1)
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE ((id = ANY ($1::integer[])))
++         Semijoin Path: index
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.491 ms
++         Semijoin Keys Sent: 45 bytes_sent=200
++(6 rows)
++
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++                                           sj_explain_analyze                                            
++---------------------------------------------------------------------------------------------------------
++   ->  Foreign Scan on public.ft_customers c (actual rows=45.00 loops=1)
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE (public.sjb_contains($1::bytea, id))
++         Semijoin Path: filter
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.491 ms
++         Semijoin Filter: mode=bloom keys=45 m=748 k=12 bytes_sent=238
++(6 rows)
++
++-- the same filter in binary (about half the bytes)
++SET postgres_fdw.semijoin_binary_filter = on;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++                                           sj_explain_analyze                                            
++---------------------------------------------------------------------------------------------------------
++   ->  Foreign Scan on public.ft_customers c (actual rows=45.00 loops=1)
++         Remote SQL: SELECT id, name FROM sj_remote.customers WHERE (public.sjb_contains($1::bytea, id))
++         Semijoin Path: filter
++         Semijoin Estimated Keys: 45
++         Semijoin Predicted Time: index=0.377 ms filter=0.489 ms
++         Semijoin Filter: mode=bloom keys=45 m=813 k=13 bytes_sent=126 (binary)
++(6 rows)
++
++RESET postgres_fdw.semijoin_binary_filter;
++RESET postgres_fdw.semijoin_force_path;
++-- ===================================================================
++-- Step 6: correctness for every path. Some keys are NULL and some have
++-- no customer, so the join drops rows on both sides.
++-- ===================================================================
++-- the first one with verbose on: the NOTICEs show that the "on" run
++-- inside sj_compare really is rewritten (the "off" run prints nothing)
++SET postgres_fdw.semijoin_force_path = auto;
++SET postgres_fdw.semijoin_verbose = on;
++\set VERBOSITY terse
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++NOTICE:  postgres_fdw semijoin: filter path (cost model): n_est=172.5 (r=180, N=300, D_local=270), s_rows=2000, rows_per_key=1.000, row_width=35.00 (2 columns), fetch_size=100, max_filter_bytes=1048576
++NOTICE:  semijoin: foreign scan rows 667 -> 175
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++     146 |             0 |             0
++(1 row)
++
++\set VERBOSITY default
++RESET postgres_fdw.semijoin_verbose;
++SET postgres_fdw.semijoin_force_path = index;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++     146 |             0 |             0
++(1 row)
++
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++     146 |             0 |             0
++(1 row)
++
++SET postgres_fdw.semijoin_binary_filter = on;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++     146 |             0 |             0
++(1 row)
++
++RESET postgres_fdw.semijoin_binary_filter;
++-- ===================================================================
++-- Step 7: only NULL keys, and an empty local result. The key list or
++-- filter is then NULL, so no customer passes, and the join is empty.
++-- ===================================================================
++SET postgres_fdw.semijoin_force_path = index;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.customer_id IS NULL$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++       0 |             0 |             0
++(1 row)
++
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id < 0$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++       0 |             0 |             0
++(1 row)
++
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.customer_id IS NULL$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++       0 |             0 |             0
++(1 row)
++
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id < 0$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++       0 |             0 |             0
++(1 row)
++
++RESET postgres_fdw.semijoin_force_path;
++-- ===================================================================
++-- Step 8: GROUP BY is rewritten too, and gives the same groups
++-- ===================================================================
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT c.city, count(*), sum(o.amount)
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 100
++GROUP BY c.city;
++                                                                                                                                                           QUERY PLAN                                                                                                                                                            
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++ GroupAggregate
++   Output: c.city, count(*), sum(o.amount)
++   Group Key: c.city
++   InitPlan 1
++     ->  Aggregate
++           Output: sjb_build_auto(array_agg(o_1.customer_id), '2000'::double precision, '1'::double precision, '29'::double precision, '1000'::double precision, '158.19'::double precision, '1048576'::bigint, '2'::double precision, '0.06194'::double precision, '0.54819'::double precision, '0.245'::double precision, 100)
++           ->  Seq Scan on public.orders_l o_1
++                 Output: o_1.order_id, o_1.customer_id, o_1.amount
++                 Filter: ((o_1.customer_id IS NOT NULL) AND (o_1.order_id <= 100))
++   ->  Sort
++         Output: c.city, o.amount
++         Sort Key: c.city
++         ->  Hash Join
++               Output: c.city, o.amount
++               Hash Cond: (c.id = o.customer_id)
++               ->  Foreign Scan on public.ft_customers c
++                     Output: c.id, c.name, c.city
++                     Remote SQL: SELECT id, city FROM sj_remote.customers WHERE (public.sjb_contains($1::bytea, id))
++                     Semijoin Path: filter
++                     Semijoin Estimated Keys: 88
++                     Semijoin Predicted Time: index=0.621 ms filter=0.535 ms
++               ->  Hash
++                     Output: o.amount, o.customer_id
++                     ->  Seq Scan on public.orders_l o
++                           Output: o.amount, o.customer_id
++                           Filter: (o.order_id <= 100)
++(26 rows)
++
++SELECT * FROM sj_compare($$SELECT c.city, count(*) AS num_orders, sum(o.amount) AS total FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 100 GROUP BY c.city$$);
++ on_rows | off_except_on | on_except_off 
++---------+---------------+---------------
++       9 |             0 |             0
++(1 row)
++
++-- ===================================================================
++-- Step 9: queries that must NOT be rewritten (verbose says why)
++-- ===================================================================
++SET postgres_fdw.semijoin_verbose = on;
++-- a LEFT JOIN needs the unmatched orders too
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o LEFT JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++NOTICE:  postgres_fdw semijoin: no rewrite: the query uses a join that is not an INNER JOIN
++                          QUERY PLAN                          
++--------------------------------------------------------------
++ Hash Right Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(11 rows)
++
++-- a volatile local condition could pick other rows on the second read
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50 AND random() < 2;
++NOTICE:  postgres_fdw semijoin: no rewrite: a local condition contains a volatile function
++                          QUERY PLAN                          
++--------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   Join Filter: (random() < '2'::double precision)
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(12 rows)
++
++-- the table option semijoin_filter = false wins over the server's true
++ALTER FOREIGN TABLE ft_customers OPTIONS (ADD semijoin_filter 'false');
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++NOTICE:  postgres_fdw semijoin: no rewrite: semijoin_filter is not true for this server/table
++                          QUERY PLAN                          
++--------------------------------------------------------------
++ Hash Join
++   Output: o.order_id, c.name
++   Hash Cond: (c.id = o.customer_id)
++   ->  Foreign Scan on public.ft_customers c
++         Output: c.id, c.name, c.city
++         Remote SQL: SELECT id, name FROM sj_remote.customers
++   ->  Hash
++         Output: o.order_id, o.customer_id
++         ->  Seq Scan on public.orders_l o
++               Output: o.order_id, o.customer_id
++               Filter: (o.order_id <= 50)
++(11 rows)
++
++ALTER FOREIGN TABLE ft_customers OPTIONS (DROP semijoin_filter);
++-- an invalid option value is rejected
++ALTER SERVER sj_loopback OPTIONS (SET semijoin_filter 'maybe');
++ERROR:  semijoin_filter requires a Boolean value
++RESET postgres_fdw.semijoin_verbose;
++-- ===================================================================
++-- Step 10: clean up
++-- ===================================================================
++DROP FUNCTION sj_compare(text);
++DROP FUNCTION sj_explain_analyze(text);
++DROP FOREIGN TABLE ft_customers;
++DROP TABLE orders_l;
++DROP SCHEMA sj_remote CASCADE;
++NOTICE:  drop cascades to table sj_remote.customers
++DROP USER MAPPING FOR CURRENT_USER SERVER sj_loopback;
++DROP SERVER sj_loopback;
++DROP EXTENSION sjbloom;
++DROP EXTENSION postgres_fdw;
 diff --git a/contrib/postgres_fdw/meson.build b/contrib/postgres_fdw/meson.build
 index c96030ca08..6262c2e02b 100644
 --- a/contrib/postgres_fdw/meson.build
@@ -23,7 +518,7 @@ index c96030ca08..6262c2e02b 100644
  )
  
 diff --git a/contrib/postgres_fdw/option.c b/contrib/postgres_fdw/option.c
-index 0ab1fd7018..8c16318cda 100644
+index 0ab1fd7018..9e5881fd24 100644
 --- a/contrib/postgres_fdw/option.c
 +++ b/contrib/postgres_fdw/option.c
 @@ -19,6 +19,7 @@
@@ -34,7 +529,7 @@ index 0ab1fd7018..8c16318cda 100644
  #include "postgres_fdw.h"
  #include "utils/guc.h"
  #include "utils/varlena.h"
-@@ -50,6 +51,46 @@ static PQconninfoOption *libpq_options;
+@@ -50,6 +51,47 @@ static PQconninfoOption *libpq_options;
   */
  char	   *pgfdw_application_name = NULL;
  
@@ -49,6 +544,7 @@ index 0ab1fd7018..8c16318cda 100644
 +bool		pgfdw_enable_semijoin = true;
 +int			pgfdw_semijoin_force_path = SEMIJOIN_PATH_AUTO;
 +bool		pgfdw_semijoin_verbose = false;
++bool		pgfdw_semijoin_binary_filter = false;
 +double		pgfdw_semijoin_network_mbit = 1000.0;
 +int			pgfdw_semijoin_max_filter_kb = 1024;
 +
@@ -81,7 +577,7 @@ index 0ab1fd7018..8c16318cda 100644
  /*
   * Helper functions
   */
-@@ -126,7 +167,8 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
+@@ -126,7 +168,8 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
  			strcmp(def->defname, "parallel_commit") == 0 ||
  			strcmp(def->defname, "parallel_abort") == 0 ||
  			strcmp(def->defname, "keep_connections") == 0 ||
@@ -91,7 +587,7 @@ index 0ab1fd7018..8c16318cda 100644
  		{
  			/* these accept only boolean values */
  			(void) defGetBoolean(def);
-@@ -283,6 +325,13 @@ InitPgFdwOptions(void)
+@@ -283,6 +326,13 @@ InitPgFdwOptions(void)
  		{"use_scram_passthrough", ForeignServerRelationId, false},
  		{"use_scram_passthrough", UserMappingRelationId, false},
  
@@ -105,7 +601,7 @@ index 0ab1fd7018..8c16318cda 100644
  		/*
  		 * sslcert and sslkey are in fact libpq options, but we repeat them
  		 * here to allow them to appear in both foreign server context (when
-@@ -596,5 +645,145 @@ _PG_init(void)
+@@ -596,5 +646,156 @@ _PG_init(void)
  							   NULL,
  							   NULL);
  
@@ -141,6 +637,17 @@ index 0ab1fd7018..8c16318cda 100644
 +							 "Prints a NOTICE explaining every semijoin decision.",
 +							 NULL,
 +							 &pgfdw_semijoin_verbose,
++							 false,
++							 PGC_USERSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomBoolVariable("postgres_fdw.semijoin_binary_filter",
++							 "Sends bytea query parameters (such as the semijoin filter) in binary instead of hex text.",
++							 "Halves the bytes of the filter on the wire.",
++							 &pgfdw_semijoin_binary_filter,
 +							 false,
 +							 PGC_USERSET,
 +							 0,
@@ -251,8 +758,268 @@ index 0ab1fd7018..8c16318cda 100644
 +	prev_planner_hook = planner_hook;
 +	planner_hook = pgfdw_semijoin_planner;
  }
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index b276558de6..4beffdab3b 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -84,6 +84,13 @@ enum FdwScanPrivateIndex
+ 	 * of join, added when the scan is join
+ 	 */
+ 	FdwScanPrivateRelations,
++
++	/*
++	 * CS631: List with our semijoin decision (see pgfdw_semijoin_plan_info),
++	 * added only for a scan rewritten by our hook. For a plain table scan,
++	 * FdwScanPrivateRelations is then a NULL placeholder.
++	 */
++	FdwScanPrivateSemijoin,
+ };
+ 
+ /*
+@@ -162,6 +169,15 @@ typedef struct PgFdwScanState
+ 	int			num_tuples;		/* # of tuples in array */
+ 	int			next_tuple;		/* index of next one to return */
+ 
++	/*
++	 * CS631 Batch 7: with postgres_fdw.semijoin_binary_filter on, bytea
++	 * parameters are sent in binary. param_formats[i] = 1 for those (0 =
++	 * text), param_lengths[i] = their length. Both NULL if all parameters
++	 * are text, exactly as before.
++	 */
++	int		   *param_formats;
++	int		   *param_lengths;
++
+ 	/* batch-level state, for optimizing rewinds and avoiding useless fetch */
+ 	int			fetch_ct_2;		/* Min(# of fetches done, 2) */
+ 	bool		eof_reached;	/* true if last fetch reached EOF */
+@@ -174,6 +190,11 @@ typedef struct PgFdwScanState
+ 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
+ 
+ 	int			fetch_size;		/* number of tuples per fetch */
++
++	/* CS631: semijoin info from fdw_private (NIL if not rewritten) */
++	List	   *semijoin_info;
++	int			semijoin_param_index;	/* which param is our filter/list */
++	SemijoinRuntime semijoin_runtime;	/* what was really sent */
+ } PgFdwScanState;
+ 
+ /*
+@@ -501,7 +522,9 @@ static void prepare_query_params(PlanState *node,
+ static void process_query_params(ExprContext *econtext,
+ 								 FmgrInfo *param_flinfo,
+ 								 List *param_exprs,
+-								 const char **param_values);
++								 const char **param_values,
++								 const int *param_formats,
++								 int *param_lengths);
+ static int	postgresAcquireSampleRowsFunc(Relation relation, int elevel,
+ 										  HeapTuple *rows, int targrows,
+ 										  double *totalrows,
+@@ -767,6 +790,9 @@ postgresGetForeignRelSize(PlannerInfo *root,
+ 		/* Estimate baserel size as best we can with local statistics. */
+ 		set_baserel_size_estimates(root, baserel);
+ 
++		/* CS631: use the semijoin hook's expected rows for a rewritten scan */
++		pgfdw_apply_semijoin_hint(root, baserel, foreigntableid);
++
+ 		/* Fill in basically-bogus cost estimates for use later. */
+ 		estimate_path_cost_size(root, baserel, NIL, NIL, NULL,
+ 								&fpinfo->rows, &fpinfo->width,
+@@ -1424,6 +1450,25 @@ postgresGetForeignPlan(PlannerInfo *root,
+ 		fdw_private = lappend(fdw_private,
+ 							  makeString(fpinfo->relation_name));
+ 
++	/*
++	 * CS631: if our semijoin hook rewrote this scan, add its decision for
++	 * EXPLAIN. A plain table scan has no Relations item, so put a NULL
++	 * placeholder there first: existing positions stay where they are.
++	 */
++	if (IS_SIMPLE_REL(foreignrel))
++	{
++		List	   *semijoin_info = pgfdw_semijoin_plan_info(root, foreignrel,
++															 fpinfo->remote_conds,
++															 params_list);
++
++		if (semijoin_info != NIL)
++		{
++			if (list_length(fdw_private) == FdwScanPrivateRelations)
++				fdw_private = lappend(fdw_private, NULL);
++			fdw_private = lappend(fdw_private, semijoin_info);
++		}
++	}
++
+ 	/*
+ 	 * Create the ForeignScan node for the given relation.
+ 	 *
+@@ -1554,6 +1599,17 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
+ 	fsstate->fetch_size = intVal(list_nth(fsplan->fdw_private,
+ 										  FdwScanPrivateFetchSize));
+ 
++	/* CS631: our semijoin decision, if this scan was rewritten */
++	fsstate->semijoin_info = NIL;
++	fsstate->semijoin_param_index = -1;
++	if (list_length(fsplan->fdw_private) > FdwScanPrivateSemijoin)
++	{
++		fsstate->semijoin_info = (List *) list_nth(fsplan->fdw_private,
++												   FdwScanPrivateSemijoin);
++		fsstate->semijoin_param_index =
++			pgfdw_semijoin_info_param_index(fsstate->semijoin_info);
++	}
++
+ 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
+ 	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+ 											   "postgres_fdw tuple data",
+@@ -1592,6 +1648,32 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
+ 							 &fsstate->param_exprs,
+ 							 &fsstate->param_values);
+ 
++	/*
++	 * CS631: with postgres_fdw.semijoin_binary_filter on, send every bytea
++	 * parameter in binary (format code 1) instead of hex text.
++	 */
++	fsstate->param_formats = NULL;
++	fsstate->param_lengths = NULL;
++	if (numParams > 0 && pgfdw_semijoin_binary_filter)
++	{
++		ListCell   *lc;
++		int			i = 0;
++
++		foreach(lc, fsplan->fdw_exprs)
++		{
++			if (exprType((Node *) lfirst(lc)) == BYTEAOID)
++			{
++				if (fsstate->param_formats == NULL)
++				{
++					fsstate->param_formats = (int *) palloc0(numParams * sizeof(int));
++					fsstate->param_lengths = (int *) palloc0(numParams * sizeof(int));
++				}
++				fsstate->param_formats[i] = 1;
++			}
++			i++;
++		}
++	}
++
+ 	/* Set the async-capable flag */
+ 	fsstate->async_capable = node->ss.ps.async_capable;
+ }
+@@ -2856,7 +2938,8 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
+ 	 * We do that here, not when the plan is created, because we can't know
+ 	 * what aliases ruleutils.c will assign at plan creation time.
+ 	 */
+-	if (list_length(fdw_private) > FdwScanPrivateRelations)
++	if (list_length(fdw_private) > FdwScanPrivateRelations &&
++		list_nth(fdw_private, FdwScanPrivateRelations) != NULL)	/* CS631 */
+ 	{
+ 		StringInfo	relations;
+ 		char	   *rawrelations;
+@@ -2944,6 +3027,16 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
+ 		sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
+ 		ExplainPropertyText("Remote SQL", sql, es);
+ 	}
++
++	/* CS631: our semijoin decision, and with ANALYZE what was sent */
++	if (list_length(fdw_private) > FdwScanPrivateSemijoin)
++	{
++		PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
++
++		pgfdw_semijoin_explain((List *) list_nth(fdw_private, FdwScanPrivateSemijoin),
++							   fsstate != NULL ? &fsstate->semijoin_runtime : NULL,
++							   es);
++	}
+ }
+ 
+ /*
+@@ -3769,7 +3862,29 @@ create_cursor(ForeignScanState *node)
+ 		process_query_params(econtext,
+ 							 fsstate->param_flinfo,
+ 							 fsstate->param_exprs,
+-							 values);
++							 values,
++							 fsstate->param_formats,
++							 fsstate->param_lengths);
++
++		/*
++		 * CS631: remember what our semijoin parameter looks like, for
++		 * EXPLAIN ANALYZE. Done now, because the values live in short-lived
++		 * memory.
++		 */
++		if (fsstate->semijoin_info != NIL &&
++			fsstate->semijoin_param_index >= 0 &&
++			fsstate->semijoin_param_index < numParams)
++		{
++			int			index = fsstate->semijoin_param_index;
++			bool		binary = (fsstate->param_formats != NULL &&
++								  fsstate->param_formats[index] == 1);
++
++			pgfdw_semijoin_decode_param(values[index],
++										binary ? fsstate->param_lengths[index] : -1,
++										binary,
++										pgfdw_semijoin_info_path(fsstate->semijoin_info),
++										&fsstate->semijoin_runtime);
++		}
+ 
+ 		MemoryContextSwitchTo(oldcontext);
+ 	}
+@@ -3787,7 +3902,10 @@ create_cursor(ForeignScanState *node)
+ 	 * server has the same OIDs we do for the parameters' types.
+ 	 */
+ 	if (!PQsendQueryParams(conn, buf.data, numParams,
+-						   NULL, values, NULL, NULL, 0))
++						   NULL, values,
++						   fsstate->param_lengths,	/* CS631: NULL unless */
++						   fsstate->param_formats,	/* binary bytea params */
++						   0))
+ 		pgfdw_report_error(ERROR, NULL, conn, false, buf.data);
+ 
+ 	/*
+@@ -4588,7 +4706,9 @@ execute_dml_stmt(ForeignScanState *node)
+ 		process_query_params(econtext,
+ 							 dmstate->param_flinfo,
+ 							 dmstate->param_exprs,
+-							 values);
++							 values,
++							 NULL,
++							 NULL);
+ 
+ 	/*
+ 	 * Notice that we pass NULL for paramTypes, thus forcing the remote server
+@@ -4902,12 +5022,18 @@ prepare_query_params(PlanState *node,
+ 
+ /*
+  * Construct array of query parameter values in text format.
++ *
++ * CS631: if param_formats is not NULL, a parameter with param_formats[i]
++ * = 1 is a bytea sent in binary: its raw bytes go into param_values[i]
++ * and their number into param_lengths[i].
+  */
+ static void
+ process_query_params(ExprContext *econtext,
+ 					 FmgrInfo *param_flinfo,
+ 					 List *param_exprs,
+-					 const char **param_values)
++					 const char **param_values,
++					 const int *param_formats,
++					 int *param_lengths)
+ {
+ 	int			nestlevel;
+ 	int			i;
+@@ -4931,6 +5057,14 @@ process_query_params(ExprContext *econtext,
+ 		 */
+ 		if (isNull)
+ 			param_values[i] = NULL;
++		else if (param_formats != NULL && param_formats[i] == 1)
++		{
++			/* CS631: binary bytea; DatumGetByteaPP also detoasts it */
++			bytea	   *raw = DatumGetByteaPP(expr_value);
++
++			param_values[i] = VARDATA_ANY(raw);
++			param_lengths[i] = VARSIZE_ANY_EXHDR(raw);
++		}
+ 		else
+ 			param_values[i] = OutputFunctionCall(&param_flinfo[i], expr_value);
+ 
 diff --git a/contrib/postgres_fdw/postgres_fdw.h b/contrib/postgres_fdw/postgres_fdw.h
-index 81358f3bde..bcc2603dad 100644
+index 81358f3bde..adc82a5e9e 100644
 --- a/contrib/postgres_fdw/postgres_fdw.h
 +++ b/contrib/postgres_fdw/postgres_fdw.h
 @@ -18,6 +18,7 @@
@@ -263,7 +1030,7 @@ index 81358f3bde..bcc2603dad 100644
  #include "utils/relcache.h"
  
  /*
-@@ -178,6 +179,25 @@ extern List *ExtractExtensionList(const char *extensionsString,
+@@ -178,6 +179,26 @@ extern List *ExtractExtensionList(const char *extensionsString,
  extern char *process_pgfdw_appname(const char *appname);
  extern char *pgfdw_application_name;
  
@@ -278,6 +1045,7 @@ index 81358f3bde..bcc2603dad 100644
 +extern bool pgfdw_enable_semijoin;
 +extern int	pgfdw_semijoin_force_path;
 +extern bool pgfdw_semijoin_verbose;
++extern bool pgfdw_semijoin_binary_filter;
 +extern double pgfdw_semijoin_network_mbit;
 +extern int	pgfdw_semijoin_max_filter_kb;
 +extern double pgfdw_semijoin_t_check_ns;
@@ -289,7 +1057,7 @@ index 81358f3bde..bcc2603dad 100644
  /* in deparse.c */
  extern void classifyConditions(PlannerInfo *root,
  							   RelOptInfo *baserel,
-@@ -253,6 +273,22 @@ extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
+@@ -253,6 +274,68 @@ extern void deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root,
  									List **retrieved_attrs, List **params_list);
  extern const char *get_jointype_name(JoinType jointype);
  
@@ -304,6 +1072,52 @@ index 81358f3bde..bcc2603dad 100644
 + *                                      ParamListInfo boundParams);
 + */
 +extern planner_hook_type prev_planner_hook;
++
++/*
++ * CS631 Batch 7: the "semijoin hint". After the hook has rewritten a
++ * query, it tells the rest of postgres_fdw what it expects for the
++ * rewritten foreign table. It is set only while that query is being
++ * planned (pgfdw_semijoin_hint points to it), and is NULL otherwise.
++ */
++typedef struct SemijoinHint
++{
++	Oid			foreign_relid;	/* the rewritten foreign table */
++	AttrNumber	foreign_attno;	/* its join column */
++	Oid			contains_funcid;	/* sjb_contains (filter path only) */
++	int			path;			/* SEMIJOIN_PATH_INDEX or SEMIJOIN_PATH_FILTER */
++	double		expected_rows;	/* rows site B should send back */
++	double		n_est;			/* estimated distinct keys sent */
++	double		index_ms;		/* predicted time of the index path */
++	double		filter_ms;		/* predicted time of the filter path */
++} SemijoinHint;
++
++extern SemijoinHint *pgfdw_semijoin_hint;
++extern void pgfdw_apply_semijoin_hint(PlannerInfo *root, RelOptInfo *baserel,
++									  Oid foreigntableid);
++
++/*
++ * CS631 Batch 7: what EXPLAIN ANALYZE shows about the parameter that was
++ * really sent. create_cursor fills it in (pgfdw_semijoin_decode_param)
++ * right after the parameter values are computed. A fixed-size buffer, so
++ * no memory has to be allocated.
++ */
++typedef struct SemijoinRuntime
++{
++	bool		decoded;		/* false: show "unavailable" */
++	char		description[160];	/* e.g. "mode=bloom keys=95017 ..." */
++} SemijoinRuntime;
++
++struct ExplainState;			/* defined in commands/explain_state.h */
++
++extern List *pgfdw_semijoin_plan_info(PlannerInfo *root, RelOptInfo *foreignrel,
++									  List *remote_conds, List *params_list);
++extern int	pgfdw_semijoin_info_path(List *info);
++extern int	pgfdw_semijoin_info_param_index(List *info);
++extern void pgfdw_semijoin_decode_param(const char *value, int length,
++										bool binary, int path,
++										SemijoinRuntime *runtime);
++extern void pgfdw_semijoin_explain(List *info, SemijoinRuntime *runtime,
++								   struct ExplainState *es);
 +extern PlannedStmt *pgfdw_semijoin_planner(Query *parse,
 +										   const char *query_string,
 +										   int cursorOptions,
@@ -314,10 +1128,10 @@ index 81358f3bde..bcc2603dad 100644
  extern bool is_shippable(Oid objectId, Oid classId, PgFdwRelationInfo *fpinfo);
 diff --git a/contrib/postgres_fdw/semijoin.c b/contrib/postgres_fdw/semijoin.c
 new file mode 100644
-index 0000000000..a92dc262da
+index 0000000000..75be5a45fb
 --- /dev/null
 +++ b/contrib/postgres_fdw/semijoin.c
-@@ -0,0 +1,1701 @@
+@@ -0,0 +1,2358 @@
 +/*-------------------------------------------------------------------------
 + *
 + * semijoin.c
@@ -367,6 +1181,8 @@ index 0000000000..a92dc262da
 +#include "access/htup_details.h"
 +#include "access/sysattr.h"
 +#include "access/xact.h"
++#include "commands/explain_format.h"
++#include "commands/explain_state.h"
 +#include "catalog/pg_class.h"
 +#include "catalog/pg_operator.h"
 +#include "catalog/pg_statistic.h"
@@ -382,6 +1198,7 @@ index 0000000000..a92dc262da
 +#include "parser/analyze.h"
 +#include "parser/parse_func.h"
 +#include "parser/parser.h"
++#include "parser/parsetree.h"
 +#include "postgres_fdw.h"
 +#include "rewrite/rewriteManip.h"
 +#include "utils/builtins.h"
@@ -405,8 +1222,13 @@ index 0000000000..a92dc262da
 +#define SJB_ROW_OVERHEAD_BYTES 7
 +#define SJB_COLUMN_OVERHEAD_BYTES 4
 +
-+/* postgres_fdw sends a bytea filter as hex text: 2 characters per byte */
-+#define SJB_WIRE_FACTOR 2.0
++/*
++ * wire_factor: bytes on the wire per filter byte. postgres_fdw sends a
++ * bytea parameter as hex text (2 characters per byte), or in binary (1)
++ * when postgres_fdw.semijoin_binary_filter is on (Batch 7).
++ */
++#define SJB_WIRE_FACTOR_TEXT 2.0
++#define SJB_WIRE_FACTOR_BINARY 1.0
 +
 +/* postgres_fdw's default fetch_size (rows per FETCH) */
 +#define SJB_DEFAULT_FETCH_SIZE 100
@@ -416,6 +1238,14 @@ index 0000000000..a92dc262da
 + * it in _PG_init, and our hook calls it at the end.
 + */
 +planner_hook_type prev_planner_hook = NULL;
++
++/*
++ * Batch 7: the hint for the query that is being planned right now, or
++ * NULL. pgfdw_semijoin_planner sets it just before it calls the planner
++ * and puts the old value back right after (also after an error), so it
++ * can never be seen while planning another query.
++ */
++SemijoinHint *pgfdw_semijoin_hint = NULL;
 +
 +/*
 + * True while our hook is running. If something inside our hook ever asks
@@ -456,6 +1286,12 @@ index 0000000000..a92dc262da
 +
 +	/* true if the query uses at least one foreign table */
 +	bool		uses_foreign_table;
++
++	/* the function sjb_contains (set by build_filter_condition) */
++	Oid			contains_oid;
++
++	/* Batch 7: filled in by plan_semijoin when the query is rewritten */
++	SemijoinHint hint;
 +} SjbCandidate;
 +
 +/*
@@ -1552,48 +2388,74 @@ index 0000000000..a92dc262da
 +}
 +
 +/*
-+ * call_cost_function
++ * get_wire_factor
 + *
-+ * What it does: calls one of sjbloom's SQL functions sjb_plan_choice or
-+ * sjb_choice_report (they take the same 12 arguments, see
-+ * sjbloom--1.0.sql) directly through fmgr, PostgreSQL's function call
-+ * interface, and returns the text result.
++ * What it does: returns 1 if the filter will be sent in binary
++ * (postgres_fdw.semijoin_binary_filter = on), else 2 (hex text).
++ * Input:  none
++ * Output: the wire factor
++ * Why it exists: all cost functions and sjb_build_auto must use the same.
++ */
++static double
++get_wire_factor(void)
++{
++	if (pgfdw_semijoin_binary_filter)
++		return SJB_WIRE_FACTOR_BINARY;
++	return SJB_WIRE_FACTOR_TEXT;
++}
++
++/*
++ * invoke_cost_function
++ *
++ * What it does: calls one of sjbloom's cost model SQL functions directly
++ * through fmgr, PostgreSQL's function call interface. They all take the
++ * same 12 arguments (see sjbloom--1.0.sql), then (Batch 7) the path name
++ * for sjb_expected_remote_rows and sjb_predicted_ms only, and last the
++ * wire_factor.
 + *
 + * Inputs:  c             - the candidate (sjbloom's schema)
-+ *          function_name - "sjb_plan_choice" or "sjb_choice_report"
++ *          function_name - e.g. "sjb_plan_choice"
 + *          stats         - the estimates (n = stats->n_est)
-+ * Output:  the result text, or NULL if the function does not exist
++ *          path          - NULL for sjb_plan_choice / sjb_choice_report,
++ *                          else "index" or "filter"
++ *          result        - set to the function's result
++ * Output:  true if the function exists and returned a value
 + *
 + * Why it exists: the cost model lives in ONE place (sjbloom's
 + * costmodel.c). We call it without SPI (no SQL query is run).
 + */
-+static char *
-+call_cost_function(SjbCandidate *c, const char *function_name, SjbStats *stats)
++static bool
++invoke_cost_function(SjbCandidate *c, const char *function_name,
++					 SjbStats *stats, const char *path, Datum *result)
 +{
-+	Oid			argument_types[12];
++	Oid			argument_types[14];
++	int			num_arguments = (path == NULL) ? 13 : 14;
++	int			wire_factor_argument = num_arguments - 1;	/* the last one */
 +	Oid			function_oid;
 +	FmgrInfo	function_info;
-+	Datum		result;
 +	int			i;
 +
-+	/* LOCAL_FCINFO declares a FunctionCallInfo with room for 12 arguments */
-+	LOCAL_FCINFO(fcinfo, 12);
++	/* LOCAL_FCINFO declares a FunctionCallInfo with room for 14 arguments */
++	LOCAL_FCINFO(fcinfo, 14);
 +
 +	for (i = 0; i < 10; i++)
 +		argument_types[i] = FLOAT8OID;
 +	argument_types[10] = INT4OID;	/* fetch_size */
 +	argument_types[11] = INT8OID;	/* max_filter_bytes (Batch 6b) */
++	argument_types[12] = TEXTOID;	/* path (Batch 7), if there is one */
++	argument_types[wire_factor_argument] = FLOAT8OID;	/* wire_factor */
 +
 +	/* LookupFuncName finds a function by (schema, name) and argument types */
 +	function_oid = LookupFuncName(list_make2(makeString(c->sjbloom_schema),
 +											 makeString(pstrdup(function_name))),
-+								  12, argument_types, true);
++								  num_arguments, argument_types, true);
 +	if (!OidIsValid(function_oid))
-+		return NULL;
++		return false;
 +
-+	/* fmgr_info prepares the call; then we put the 12 arguments in place */
++	/* fmgr_info prepares the call; then we put the arguments in place */
 +	fmgr_info(function_oid, &function_info);
-+	InitFunctionCallInfoData(*fcinfo, &function_info, 12, InvalidOid, NULL, NULL);
++	InitFunctionCallInfoData(*fcinfo, &function_info, num_arguments,
++							 InvalidOid, NULL, NULL);
 +
 +	/* Float8GetDatum / Int32GetDatum / Int64GetDatum wrap a C value as a Datum */
 +	fcinfo->args[0].value = Float8GetDatum(stats->n_est);
@@ -1608,13 +2470,91 @@ index 0000000000..a92dc262da
 +	fcinfo->args[9].value = Float8GetDatum(pgfdw_semijoin_t_build_us);
 +	fcinfo->args[10].value = Int32GetDatum(stats->fetch_size);
 +	fcinfo->args[11].value = Int64GetDatum(get_max_filter_bytes());
-+	for (i = 0; i < 12; i++)
++	if (path != NULL)
++		fcinfo->args[12].value = CStringGetTextDatum(path);	/* C string -> text */
++	fcinfo->args[wire_factor_argument].value = Float8GetDatum(get_wire_factor());
++	for (i = 0; i < num_arguments; i++)
 +		fcinfo->args[i].isnull = false;
 +
-+	result = FunctionCallInvoke(fcinfo);
-+	if (fcinfo->isnull)
++	*result = FunctionCallInvoke(fcinfo);
++	return !fcinfo->isnull;
++}
++
++/*
++ * call_cost_function
++ *
++ * What it does: calls sjb_plan_choice or sjb_choice_report (12 arguments)
++ * and returns its text result.
++ * Inputs:  c, function_name, stats - as for invoke_cost_function
++ * Output:  the result text, or NULL if the function does not exist
++ * Why it exists: the decision and the verbose report are text.
++ */
++static char *
++call_cost_function(SjbCandidate *c, const char *function_name, SjbStats *stats)
++{
++	Datum		result;
++
++	if (!invoke_cost_function(c, function_name, stats, NULL, &result))
 +		return NULL;
 +	return text_to_cstring(DatumGetTextPP(result));
++}
++
++/*
++ * call_cost_number
++ *
++ * What it does: calls sjb_expected_remote_rows or sjb_predicted_ms for
++ * one path and returns the number.
++ * Inputs:  c, function_name, stats, path - as for invoke_cost_function;
++ *          value - set to the result
++ * Output:  true if it worked
++ * Why it exists: Batch 7's hint needs these numbers.
++ */
++static bool
++call_cost_number(SjbCandidate *c, const char *function_name, SjbStats *stats,
++				 const char *path, double *value)
++{
++	Datum		result;
++
++	if (!invoke_cost_function(c, function_name, stats, path, &result))
++		return false;
++	*value = DatumGetFloat8(result);	/* Datum -> C double */
++	return true;
++}
++
++/*
++ * fill_hint
++ *
++ * What it does: fills in the Batch 7 hint for a rewritten query: the
++ * foreign table, the path, n_est, the rows site B is expected to send
++ * back on that path, and both predicted times.
++ *
++ * Inputs:  c - the candidate (c->hint is filled in); stats; path
++ * Output:  true if sjbloom's functions could be called. If not, the hint
++ *          stays empty (foreign_relid = InvalidOid) and the planner keeps
++ *          its own row estimate; the rewrite itself still happens.
++ *
++ * Why it exists: postgres_fdw's row estimate and EXPLAIN read the hint.
++ */
++static bool
++fill_hint(SjbCandidate *c, SjbStats *stats, int path)
++{
++	SemijoinHint hint;
++	const char *path_name = (path == SEMIJOIN_PATH_INDEX) ? "index" : "filter";
++
++	memset(&hint, 0, sizeof(hint));
++	hint.foreign_relid = c->foreign_relid;
++	hint.foreign_attno = c->foreign_attno;
++	hint.contains_funcid = c->contains_oid;	/* InvalidOid on the index path */
++	hint.path = path;
++	hint.n_est = stats->n_est;
++
++	if (!call_cost_number(c, "sjb_expected_remote_rows", stats, path_name, &hint.expected_rows) ||
++		!call_cost_number(c, "sjb_predicted_ms", stats, "index", &hint.index_ms) ||
++		!call_cost_number(c, "sjb_predicted_ms", stats, "filter", &hint.filter_ms))
++		return false;
++
++	c->hint = hint;
++	return true;
 +}
 +
 +/*
@@ -1644,7 +2584,7 @@ index 0000000000..a92dc262da
 +	if (choice != NULL && strcmp(choice, "filter") == 0)
 +		return SEMIJOIN_PATH_FILTER;
 +
-+	c->reject_reason = "sjb_plan_choice(12 arguments) could not be called: recreate sjbloom from its current SQL file";
++	c->reject_reason = "sjb_plan_choice(13 arguments) could not be called: recreate sjbloom from its current SQL file";
 +	return -1;
 +}
 +
@@ -1751,6 +2691,7 @@ index 0000000000..a92dc262da
 +		c->reject_reason = "function sjb_contains(bytea, int4) not found";
 +		return NULL;
 +	}
++	c->contains_oid = contains_oid;
 +
 +	/* %.17g prints a double with all its digits, so nothing is rounded */
 +	build_call = psprintf("%s.sjb_build_auto(array_agg(%s), "
@@ -1766,7 +2707,7 @@ index 0000000000..a92dc262da
 +						  pgfdw_semijoin_network_mbit,
 +						  pgfdw_semijoin_t_check_ns,
 +						  max_filter_bytes,
-+						  SJB_WIRE_FACTOR,
++						  get_wire_factor(),
 +						  pgfdw_semijoin_per_message_ms,
 +						  pgfdw_semijoin_per_row_us,
 +						  pgfdw_semijoin_t_build_us,
@@ -1809,8 +2750,9 @@ index 0000000000..a92dc262da
 +					stats->s_rows, stats->rows_per_key, stats->row_width,
 +					stats->num_columns, stats->fetch_size,
 +					(long long) get_max_filter_bytes()),
-+			 errdetail("cost model %s\nsub-SELECT: %s",
++			 errdetail("cost model %s\nexpected remote rows: %.1f (index %.3f ms, filter %.3f ms)\nsub-SELECT: %s",
 +					   winner_line != NULL ? winner_line : "report not available",
++					   c->hint.expected_rows, c->hint.index_ms, c->hint.filter_ms,
 +					   sql)));
 +}
 +
@@ -1855,7 +2797,11 @@ index 0000000000..a92dc262da
 +	else
 +		return NULL;
 +
-+	if (condition != NULL && pgfdw_semijoin_verbose)
++	if (condition == NULL)
++		return NULL;
++
++	fill_hint(c, &stats, path);
++	if (pgfdw_semijoin_verbose)
 +		report_decision(c, &stats, path, sql);
 +	return condition;
 +}
@@ -1925,6 +2871,501 @@ index 0000000000..a92dc262da
 +	return condition;
 +}
 +
++/* ------------------------------------------------------------------------
++ * Batch 7: the row estimate of the rewritten foreign scan
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * is_join_column_var
++ *
++ * What it does: checks that a node is the foreign table's join column.
++ * Inputs:  node - an expression; hint - the hint; relid - the foreign
++ *          table's number in the planner's range table
++ * Output:  true or false
++ * Why it exists: our condition always has the join column as one argument.
++ */
++static bool
++is_join_column_var(Node *node, SemijoinHint *hint, Index relid)
++{
++	Var		   *var;
++
++	if (node == NULL || !IsA(node, Var))
++		return false;
++	var = (Var *) node;
++	return var->varno == relid && var->varattno == hint->foreign_attno &&
++		var->varlevelsup == 0;
++}
++
++/*
++ * is_initplan_param
++ *
++ * What it does: checks that a node is a PARAM_EXEC parameter, which is
++ * what our "(SELECT ...)" has become: the planner turned it into an
++ * InitPlan whose result is this parameter.
++ * Input:  node - an expression
++ * Output: true or false
++ * Why it exists: our condition always has it as the other argument.
++ */
++static bool
++is_initplan_param(Node *node)
++{
++	return node != NULL && IsA(node, Param) &&
++		((Param *) node)->paramkind == PARAM_EXEC;
++}
++
++/*
++ * is_semijoin_clause
++ *
++ * What it does: recognises OUR condition among the conditions of the
++ * foreign table, as the planner sees it:
++ *   index path:  join_column = ANY ($n)
++ *   filter path: sjb_contains($n, join_column)
++ *
++ * Inputs:  clause - one condition; hint; relid - see is_join_column_var
++ * Output:  true if it is our condition
++ *
++ * Why it exists: its selectivity is replaced by our expected rows, while
++ * all other conditions keep their normal selectivity.
++ */
++static bool
++is_semijoin_clause(Node *clause, SemijoinHint *hint, Index relid)
++{
++	if (hint->path == SEMIJOIN_PATH_INDEX && IsA(clause, ScalarArrayOpExpr))
++	{
++		ScalarArrayOpExpr *any_expr = (ScalarArrayOpExpr *) clause;
++
++		return any_expr->opno == Int4EqualOperator && any_expr->useOr &&
++			list_length(any_expr->args) == 2 &&
++			is_join_column_var((Node *) linitial(any_expr->args), hint, relid) &&
++			is_initplan_param((Node *) lsecond(any_expr->args));
++	}
++
++	if (hint->path == SEMIJOIN_PATH_FILTER && IsA(clause, FuncExpr))
++	{
++		FuncExpr   *func = (FuncExpr *) clause;
++
++		return func->funcid == hint->contains_funcid &&
++			list_length(func->args) == 2 &&
++			is_initplan_param((Node *) linitial(func->args)) &&
++			is_join_column_var((Node *) lsecond(func->args), hint, relid);
++	}
++	return false;
++}
++
++/*
++ * pgfdw_apply_semijoin_hint
++ *
++ * What it does: called by postgresGetForeignRelSize, right after
++ * PostgreSQL's normal estimate set_baserel_size_estimates. If this is the
++ * foreign table our hook rewrote, it replaces the row estimate:
++ *     baserel->rows = expected_rows * (selectivity of the OTHER conditions)
++ * The planner cannot see inside "= ANY ($n)" (it guesses ~10 rows) or
++ * sjb_contains (it guesses 1/3 of the table); our cost model knows better.
++ * postgres_fdw derives everything else (fpinfo->rows, retrieved_rows, the
++ * per-row costs) from baserel->rows, so this is the only value we change.
++ *
++ * It does nothing unless ALL of these hold:
++ *   - a hint is set (only while our rewritten query is planned),
++ *   - its OID is this foreign table's,
++ *   - root->query_level == 1: the top-level query, never a subquery,
++ *   - our own condition is found among the table's conditions.
++ *
++ * Inputs:  root - the planner's state; baserel - the foreign table;
++ *          foreigntableid - its OID
++ * Output:  none (baserel->rows may change)
++ *
++ * Why it exists: with ~10 estimated rows the planner picked a Nested Loop
++ * with a Join Filter at n <= 1000 instead of a Hash Join.
++ */
++void
++pgfdw_apply_semijoin_hint(PlannerInfo *root, RelOptInfo *baserel,
++						  Oid foreigntableid)
++{
++	SemijoinHint *hint = pgfdw_semijoin_hint;
++	List	   *other_clauses = NIL;
++	bool		found = false;
++	Selectivity other_selectivity;
++	double		old_rows = baserel->rows;
++	ListCell   *cell;
++
++	if (hint == NULL || hint->foreign_relid != foreigntableid ||
++		root->query_level != 1)
++		return;
++
++	/* split the table's conditions into ours and the others */
++	foreach(cell, baserel->baserestrictinfo)
++	{
++		/* lfirst_node = lfirst, plus a check of the node type */
++		RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
++
++		if (!found && is_semijoin_clause((Node *) rinfo->clause, hint, baserel->relid))
++			found = true;
++		else
++			other_clauses = lappend(other_clauses, rinfo);
++	}
++	if (!found)
++		return;
++
++	/* the planner's normal selectivity of all the other conditions */
++	other_selectivity = clauselist_selectivity(root, other_clauses,
++											   baserel->relid, JOIN_INNER, NULL);
++
++	/* clamp_row_est rounds and keeps the estimate at least 1 */
++	baserel->rows = clamp_row_est(hint->expected_rows * other_selectivity);
++
++	if (pgfdw_semijoin_verbose)
++		ereport(NOTICE,
++				(errmsg("semijoin: foreign scan rows %.0f -> %.0f",
++						old_rows, baserel->rows)));
++}
++
++/* ------------------------------------------------------------------------
++ * Batch 7: our decision in EXPLAIN
++ * ------------------------------------------------------------------------
++ */
++
++/*
++ * Positions inside our own list, which postgresGetForeignPlan stores in
++ * the ForeignScan's fdw_private at position FdwScanPrivateSemijoin.
++ * Only plain node types (Integer, Float) are used, so the plan can be
++ * copied and saved like any other plan.
++ */
++enum SemijoinPrivateIndex
++{
++	SemijoinPrivatePath,		/* Integer: SEMIJOIN_PATH_INDEX or _FILTER */
++	SemijoinPrivateKeys,		/* Float: n_est */
++	SemijoinPrivateIndexMs,		/* Float: predicted time, index path */
++	SemijoinPrivateFilterMs,	/* Float: predicted time, filter path */
++	SemijoinPrivateParamIndex,	/* Integer: our parameter ($n is n-1), or -1 */
++};
++
++/*
++ * Layout of the 24-byte filter header written by sjbloom (see
++ * sjbloom/sjb_filter.h in the project): version uint8, mode uint8,
++ * k uint16, nkeys uint32, m uint64, seed uint64. sjbloom writes it with
++ * memcpy in the machine's byte order; site A built the filter, so we read
++ * it back the same way.
++ */
++#define SJB_HEADER_SIZE 24
++#define SJB_HEADER_VERSION 3
++#define SJB_OFFSET_VERSION 0
++#define SJB_OFFSET_MODE 1
++#define SJB_OFFSET_K 2
++#define SJB_OFFSET_NKEYS 4
++#define SJB_OFFSET_M 8
++
++/*
++ * pgfdw_semijoin_plan_info
++ *
++ * What it does: called by postgresGetForeignPlan. If our hook rewrote this
++ * foreign scan, it returns a small List with the decision (path, n_est,
++ * both predicted times) and the position of our parameter among the
++ * scan's parameters ($1, $2, ...), so that EXPLAIN can show them later.
++ *
++ * Inputs:  root, foreignrel - the planner's state and the foreign table
++ *          remote_conds     - the conditions sent to site B (RestrictInfos)
++ *          params_list      - the parameters of the remote query, in order
++ * Output:  the List, or NIL if this scan was not rewritten
++ *
++ * Why it exists: the hint only lives while the query is planned, but
++ * EXPLAIN runs later, from the finished plan. So the values are copied
++ * into the plan itself.
++ */
++List *
++pgfdw_semijoin_plan_info(PlannerInfo *root, RelOptInfo *foreignrel,
++						 List *remote_conds, List *params_list)
++{
++	SemijoinHint *hint = pgfdw_semijoin_hint;
++	RangeTblEntry *rte;
++	Node	   *our_param = NULL;
++	int			param_index = -1;
++	int			position;
++	ListCell   *cell;
++
++	if (hint == NULL || root->query_level != 1 ||
++		foreignrel->reloptkind != RELOPT_BASEREL)
++		return NIL;
++
++	/* planner_rt_fetch: the range table entry of this relation */
++	rte = planner_rt_fetch(foreignrel->relid, root);
++	if (rte->relid != hint->foreign_relid)
++		return NIL;
++
++	/* find our condition, and in it our parameter */
++	foreach(cell, remote_conds)
++	{
++		RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
++		List	   *args;
++
++		if (!is_semijoin_clause((Node *) rinfo->clause, hint, foreignrel->relid))
++			continue;
++		if (IsA(rinfo->clause, ScalarArrayOpExpr))
++			args = ((ScalarArrayOpExpr *) rinfo->clause)->args;
++		else
++			args = ((FuncExpr *) rinfo->clause)->args;
++		our_param = (hint->path == SEMIJOIN_PATH_INDEX) ? lsecond(args) : linitial(args);
++		break;
++	}
++	if (our_param == NULL)
++		return NIL;				/* our condition is not sent to site B */
++
++	/* its position among the remote query's parameters */
++	position = 0;
++	foreach(cell, params_list)
++	{
++		/* equal() compares two node trees */
++		if (equal(lfirst(cell), our_param))
++		{
++			param_index = position;
++			break;
++		}
++		position++;
++	}
++
++	/* makeInteger / makeFloat wrap a number as a node (Float keeps text) */
++	return list_make5(makeInteger(hint->path),
++					  makeFloat(psprintf("%.17g", hint->n_est)),
++					  makeFloat(psprintf("%.17g", hint->index_ms)),
++					  makeFloat(psprintf("%.17g", hint->filter_ms)),
++					  makeInteger(param_index));
++}
++
++/*
++ * pgfdw_semijoin_info_path / pgfdw_semijoin_info_param_index
++ *
++ * What they do: read the path and the parameter position back from the
++ * List made by pgfdw_semijoin_plan_info.
++ * Input:  info - that List
++ * Output: the path / the parameter position (-1 = unknown)
++ * Why they exist: postgres_fdw.c should not need to know the List's
++ * layout.
++ */
++int
++pgfdw_semijoin_info_path(List *info)
++{
++	return intVal(list_nth(info, SemijoinPrivatePath));
++}
++
++int
++pgfdw_semijoin_info_param_index(List *info)
++{
++	return intVal(list_nth(info, SemijoinPrivateParamIndex));
++}
++
++/*
++ * hex_digit_value
++ *
++ * What it does: the value 0-15 of one hex digit, or -1 if it is not one.
++ * Input:  digit - a character
++ * Output: its value, or -1
++ * Why it exists: a bytea parameter is sent as hex text ("\x0301...").
++ */
++static int
++hex_digit_value(char digit)
++{
++	if (digit >= '0' && digit <= '9')
++		return digit - '0';
++	if (digit >= 'a' && digit <= 'f')
++		return digit - 'a' + 10;
++	if (digit >= 'A' && digit <= 'F')
++		return digit - 'A' + 10;
++	return -1;
++}
++
++/*
++ * decode_filter
++ *
++ * What it does: reads the 24-byte sjbloom header of a filter and
++ * describes it, e.g. "mode=bloom keys=95017 m=1471893 k=10
++ * bytes_sent=184014".
++ *
++ * Inputs:  value   - the parameter as sent: hex text ("\x" + hex
++ *                    digits), or the raw bytes if binary
++ *          length  - number of raw bytes (binary only)
++ *          binary  - true if the filter was sent in binary (Batch 7)
++ *          runtime - the description is written here
++ * Output:  true if the value really is an sjbloom filter
++ *
++ * Why it exists: EXPLAIN ANALYZE shows what the filter really was, which
++ * sjb_build_auto only decided at run time.
++ */
++static bool
++decode_filter(const char *value, int length, bool binary, SemijoinRuntime *runtime)
++{
++	unsigned char header[SJB_HEADER_SIZE];
++	size_t		bytes_sent;
++	uint8		version;
++	uint8		mode;
++	uint16		k;
++	uint32		num_keys;
++	uint64		m;
++	int			i;
++
++	if (binary)
++	{
++		/* the raw bytes: the header is simply the first 24 of them */
++		if (length < SJB_HEADER_SIZE)
++			return false;
++		memcpy(header, value, SJB_HEADER_SIZE);
++		bytes_sent = length;
++	}
++	else
++	{
++		/* hex text: two hex digits per byte, after "\x" */
++		bytes_sent = strlen(value);
++		if (bytes_sent < 2 + 2 * SJB_HEADER_SIZE || value[0] != '\\' || value[1] != 'x')
++			return false;
++
++		for (i = 0; i < SJB_HEADER_SIZE; i++)
++		{
++			int			high = hex_digit_value(value[2 + 2 * i]);
++			int			low = hex_digit_value(value[2 + 2 * i + 1]);
++
++			if (high < 0 || low < 0)
++				return false;
++			header[i] = (unsigned char) (high * 16 + low);
++		}
++	}
++
++	/* read the fields with memcpy, never by casting pointers */
++	memcpy(&version, header + SJB_OFFSET_VERSION, sizeof(version));
++	memcpy(&mode, header + SJB_OFFSET_MODE, sizeof(mode));
++	memcpy(&k, header + SJB_OFFSET_K, sizeof(k));
++	memcpy(&num_keys, header + SJB_OFFSET_NKEYS, sizeof(num_keys));
++	memcpy(&m, header + SJB_OFFSET_M, sizeof(m));
++
++	if (version != SJB_HEADER_VERSION)
++		return false;
++
++	if (mode == 1)
++		snprintf(runtime->description, sizeof(runtime->description),
++				 "mode=bloom keys=%u m=%llu k=%u bytes_sent=%zu%s",
++				 (unsigned int) num_keys, (unsigned long long) m,
++				 (unsigned int) k, bytes_sent, binary ? " (binary)" : "");
++	else if (mode == 2)
++		snprintf(runtime->description, sizeof(runtime->description),
++				 "mode=exact keys=%u bytes_sent=%zu%s",
++				 (unsigned int) num_keys, bytes_sent, binary ? " (binary)" : "");
++	else if (mode == 3)
++		snprintf(runtime->description, sizeof(runtime->description),
++				 "mode=pass bytes_sent=%zu%s", bytes_sent, binary ? " (binary)" : "");
++	else
++		return false;
++	return true;
++}
++
++/*
++ * decode_key_list_text
++ *
++ * What it does: counts the elements of an int4[] in text form, e.g.
++ * "{12,345,6789}" has 3, and describes it: "3 bytes_sent=13".
++ *
++ * Inputs:  value - the parameter as sent; runtime - written here
++ * Output:  true if the text looks like an array
++ *
++ * Why it exists: EXPLAIN ANALYZE shows how many keys the index path sent.
++ */
++static bool
++decode_key_list_text(const char *value, SemijoinRuntime *runtime)
++{
++	size_t		length = strlen(value);
++	long		num_keys = 0;
++	size_t		i;
++
++	if (length < 2 || value[0] != '{' || value[length - 1] != '}')
++		return false;
++
++	if (length > 2)
++	{
++		num_keys = 1;			/* n elements are separated by n - 1 commas */
++		for (i = 1; i < length - 1; i++)
++		{
++			if (value[i] == ',')
++				num_keys++;
++		}
++	}
++
++	snprintf(runtime->description, sizeof(runtime->description),
++			 "%ld bytes_sent=%zu", num_keys, length);
++	return true;
++}
++
++/*
++ * pgfdw_semijoin_decode_param
++ *
++ * What it does: called by create_cursor with the value of our parameter,
++ * just before it is sent; describes it for EXPLAIN ANALYZE.
++ *
++ * Inputs:  value   - the parameter's text, or its raw bytes if binary
++ *                    (NULL if the value is NULL)
++ *          length  - number of raw bytes (binary only, else -1)
++ *          binary  - true if sent in binary (semijoin_binary_filter)
++ *          path    - SEMIJOIN_PATH_INDEX or SEMIJOIN_PATH_FILTER
++ *          runtime - filled in; runtime->decoded = false if the value
++ *                    could not be read ("unavailable")
++ * Output:  none. It never raises an error.
++ *
++ * Why it exists: to show what really happened at run time.
++ */
++void
++pgfdw_semijoin_decode_param(const char *value, int length, bool binary,
++							int path, SemijoinRuntime *runtime)
++{
++	runtime->decoded = false;
++	if (value == NULL)
++		return;
++
++	if (path == SEMIJOIN_PATH_FILTER)
++		runtime->decoded = decode_filter(value, length, binary, runtime);
++	else if (!binary)
++		runtime->decoded = decode_key_list_text(value, runtime);
++}
++
++/*
++ * pgfdw_semijoin_explain
++ *
++ * What it does: adds our lines to EXPLAIN of a rewritten foreign scan:
++ *     Semijoin Path: index | filter
++ *     Semijoin Estimated Keys: <n_est>
++ *     Semijoin Predicted Time: index=<ms> filter=<ms>
++ * and with ANALYZE what was really sent:
++ *     Semijoin Filter: mode=... keys=... m=... k=... bytes_sent=...
++ *     Semijoin Keys Sent: <number of keys> bytes_sent=...
++ *
++ * Inputs:  info    - the List made by pgfdw_semijoin_plan_info
++ *          runtime - filled in by create_cursor, or NULL (plain EXPLAIN)
++ *          es      - EXPLAIN's state
++ * Output:  none
++ *
++ * Why it exists: so a user can see in EXPLAIN what our hook decided.
++ */
++void
++pgfdw_semijoin_explain(List *info, SemijoinRuntime *runtime, ExplainState *es)
++{
++	int			path = intVal(list_nth(info, SemijoinPrivatePath));
++	double		n_est = floatVal(list_nth(info, SemijoinPrivateKeys));
++	double		index_ms = floatVal(list_nth(info, SemijoinPrivateIndexMs));
++	double		filter_ms = floatVal(list_nth(info, SemijoinPrivateFilterMs));
++	const char *runtime_text = "unavailable";
++
++	/* ExplainPropertyText / ...Float add one "Label: value" line */
++	ExplainPropertyText("Semijoin Path",
++						path == SEMIJOIN_PATH_INDEX ? "index" : "filter", es);
++	ExplainPropertyFloat("Semijoin Estimated Keys", NULL, n_est, 0, es);
++	ExplainPropertyText("Semijoin Predicted Time",
++						psprintf("index=%.3f ms filter=%.3f ms", index_ms, filter_ms),
++						es);
++
++	if (!es->analyze)
++		return;
++
++	if (runtime != NULL && runtime->decoded)
++		runtime_text = runtime->description;
++	ExplainPropertyText(path == SEMIJOIN_PATH_FILTER ? "Semijoin Filter" : "Semijoin Keys Sent",
++						runtime_text, es);
++}
++
 +/*
 + * attach_condition
 + *
@@ -1984,6 +3425,14 @@ index 0000000000..a92dc262da
 +	 * breaking that rule is an error we could not hide. So we never start a
 +	 * subtransaction there.
 +	 */
++	SemijoinHint my_hint;
++	SemijoinHint *saved_hint = pgfdw_semijoin_hint;
++	PlannedStmt *result;
++
++	/* no hint unless this query is rewritten below */
++	memset(&my_hint, 0, sizeof(my_hint));
++	my_hint.foreign_relid = InvalidOid;
++
 +	if (pgfdw_enable_semijoin && !in_semijoin_hook && !IsInParallelMode())
 +	{
 +		SjbCandidate candidate;
@@ -2001,7 +3450,10 @@ index 0000000000..a92dc262da
 +				condition = try_plan_semijoin(parse, &candidate);
 +
 +			if (condition != NULL)
++			{
++				my_hint = candidate.hint;	/* may be empty: see fill_hint */
 +				attach_condition(parse, condition);	/* last step */
++			}
 +			else if (candidate.uses_foreign_table &&
 +					 (pgfdw_semijoin_verbose || candidate.always_report))
 +				ereport(NOTICE,
@@ -2015,7 +3467,287 @@ index 0000000000..a92dc262da
 +		PG_END_TRY();
 +	}
 +
-+	if (prev_planner_hook != NULL)
-+		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
-+	return standard_planner(parse, query_string, cursorOptions, boundParams);
++	/*
++	 * Batch 7: make our hint (or NULL, if this query was not rewritten)
++	 * visible while THIS query is planned, and put the previous value back
++	 * afterwards, even after an error. So a query planned inside this one
++	 * (or the next query) never sees our hint. my_hint lives on our stack,
++	 * which is fine: it is only used during the call below.
++	 */
++	pgfdw_semijoin_hint = OidIsValid(my_hint.foreign_relid) ? &my_hint : NULL;
++	PG_TRY();
++	{
++		if (prev_planner_hook != NULL)
++			result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
++		else
++			result = standard_planner(parse, query_string, cursorOptions, boundParams);
++	}
++	PG_FINALLY();
++	{
++		pgfdw_semijoin_hint = saved_hint;
++	}
++	PG_END_TRY();
++
++	return result;
 +}
+diff --git a/contrib/postgres_fdw/sql/semijoin.sql b/contrib/postgres_fdw/sql/semijoin.sql
+new file mode 100644
+index 0000000000..4931514771
+--- /dev/null
++++ b/contrib/postgres_fdw/sql/semijoin.sql
+@@ -0,0 +1,255 @@
++-- ===================================================================
++-- CS631: tests of the automatic semijoin rewrite (semijoin.c).
++--
++-- Needs the sjbloom extension (CS631 project), which plain PostgreSQL does
++-- not have, so this test is NOT in the default REGRESS list. Run it with:
++--     make installcheck REGRESS=semijoin
++--
++-- A loopback server plays "site B": the "remote" table lives in schema
++-- sj_remote of this same database, and ft_customers points to it.
++-- ===================================================================
++
++-- ===================================================================
++-- Step 0: fixed values for every cost constant and the network speed,
++-- so the expected output never depends on a future recalibration (the
++-- values are the current defaults, from results/calibration.json). They
++-- are set before postgres_fdw is loaded; it takes them over when it
++-- defines its settings.
++-- ===================================================================
++SET postgres_fdw.semijoin_network_mbit = 1000;
++SET postgres_fdw.semijoin_t_check_ns = 158.19;
++SET postgres_fdw.semijoin_t_lookup_us = 4.7956;
++SET postgres_fdw.semijoin_per_message_ms = 0.06194;
++SET postgres_fdw.semijoin_per_row_us = 0.54819;
++SET postgres_fdw.semijoin_t_build_us = 0.245;
++SET postgres_fdw.semijoin_max_filter_kb = 1024;
++SET postgres_fdw.semijoin_binary_filter = off;
++
++-- ===================================================================
++-- Step 1: extensions, loopback server, user mapping
++-- ===================================================================
++CREATE EXTENSION postgres_fdw;
++CREATE EXTENSION sjbloom;
++-- make sure our planner hook is installed in this session
++LOAD 'postgres_fdw';
++
++DO $d$
++    BEGIN
++        EXECUTE $$CREATE SERVER sj_loopback FOREIGN DATA WRAPPER postgres_fdw
++            OPTIONS (dbname '$$||current_database()||$$',
++                     port '$$||current_setting('port')||$$'
++            )$$;
++    END;
++$d$;
++CREATE USER MAPPING FOR CURRENT_USER SERVER sj_loopback;
++
++-- the filter functions may be sent to the "remote" side, and the rewrite
++-- is opted in for this server
++ALTER SERVER sj_loopback OPTIONS (ADD extensions 'sjbloom', ADD semijoin_filter 'true');
++
++-- ===================================================================
++-- Step 2: small tables. Customers 1..2000 at the "remote" side; 300
++-- orders whose customer_id is sometimes NULL (every 10th order) and
++-- sometimes a customer that does not exist (2001..2500).
++-- ===================================================================
++CREATE SCHEMA sj_remote;
++CREATE TABLE sj_remote.customers (
++    id   int PRIMARY KEY,
++    name text,
++    city text
++);
++INSERT INTO sj_remote.customers
++SELECT g, 'customer ' || g, 'city ' || (g % 10)
++FROM generate_series(1, 2000) AS g;
++
++CREATE FOREIGN TABLE ft_customers (id int, name text, city text)
++    SERVER sj_loopback OPTIONS (schema_name 'sj_remote', table_name 'customers');
++
++CREATE TABLE orders_l (
++    order_id    int PRIMARY KEY,
++    customer_id int,
++    amount      int
++);
++INSERT INTO orders_l
++SELECT g,
++       CASE WHEN g % 10 = 0 THEN NULL ELSE (g * 37) % 2500 + 1 END,
++       g % 97
++FROM generate_series(1, 300) AS g;
++
++-- the hook needs statistics of both tables
++ANALYZE sj_remote.customers;
++ANALYZE ft_customers;
++ANALYZE orders_l;
++
++-- ===================================================================
++-- Step 3: a helper for the correctness checks. It runs a query into a
++-- temp table with the rewrite off and again with it on, and compares
++-- the two with EXCEPT ALL in both directions (duplicates count).
++-- (A single "query EXCEPT ALL query" is a set operation, which the
++-- hook never rewrites.) Both counts must be 0.
++-- ===================================================================
++CREATE FUNCTION sj_compare(query text,
++                           OUT on_rows bigint,
++                           OUT off_except_on bigint,
++                           OUT on_except_off bigint)
++LANGUAGE plpgsql AS $$
++BEGIN
++    SET LOCAL postgres_fdw.enable_semijoin = off;
++    EXECUTE 'CREATE TEMP TABLE sj_off AS ' || query;
++    SET LOCAL postgres_fdw.enable_semijoin = on;
++    EXECUTE 'CREATE TEMP TABLE sj_on AS ' || query;
++    SET LOCAL postgres_fdw.enable_semijoin = off;
++    SELECT count(*) INTO on_rows FROM sj_on;
++    SELECT count(*) INTO off_except_on
++        FROM (SELECT * FROM sj_off EXCEPT ALL SELECT * FROM sj_on) AS d;
++    SELECT count(*) INTO on_except_off
++        FROM (SELECT * FROM sj_on EXCEPT ALL SELECT * FROM sj_off) AS d;
++    DROP TABLE sj_off, sj_on;
++END;
++$$;
++
++-- A helper for EXPLAIN ANALYZE: shows only the lines of the foreign scan
++-- that matter here, so memory sizes and the like cannot change the output.
++CREATE FUNCTION sj_explain_analyze(query text) RETURNS SETOF text
++LANGUAGE plpgsql AS $$
++DECLARE
++    line text;
++BEGIN
++    FOR line IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query
++    LOOP
++        IF line ~ '(Foreign Scan|Remote SQL|Semijoin)' THEN
++            RETURN NEXT line;
++        END IF;
++    END LOOP;
++END;
++$$;
++
++-- ===================================================================
++-- Step 4: the rewrite is visible in EXPLAIN, and can be turned off
++-- ===================================================================
++-- the cost model's choice (auto)
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++
++-- off: the original plan, all customers are fetched
++SET postgres_fdw.enable_semijoin = off;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++RESET postgres_fdw.enable_semijoin;
++
++-- ===================================================================
++-- Step 5: force_path index and filter
++-- ===================================================================
++SET postgres_fdw.semijoin_force_path = index;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++
++SET postgres_fdw.semijoin_force_path = filter;
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++
++-- EXPLAIN ANALYZE shows what was really sent
++SET postgres_fdw.semijoin_force_path = index;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++
++-- the same filter in binary (about half the bytes)
++SET postgres_fdw.semijoin_binary_filter = on;
++SELECT sj_explain_analyze($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 50$$);
++RESET postgres_fdw.semijoin_binary_filter;
++RESET postgres_fdw.semijoin_force_path;
++
++-- ===================================================================
++-- Step 6: correctness for every path. Some keys are NULL and some have
++-- no customer, so the join drops rows on both sides.
++-- ===================================================================
++-- the first one with verbose on: the NOTICEs show that the "on" run
++-- inside sj_compare really is rewritten (the "off" run prints nothing)
++SET postgres_fdw.semijoin_force_path = auto;
++SET postgres_fdw.semijoin_verbose = on;
++\set VERBOSITY terse
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++\set VERBOSITY default
++RESET postgres_fdw.semijoin_verbose;
++SET postgres_fdw.semijoin_force_path = index;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++SET postgres_fdw.semijoin_binary_filter = on;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 200$$);
++RESET postgres_fdw.semijoin_binary_filter;
++
++-- ===================================================================
++-- Step 7: only NULL keys, and an empty local result. The key list or
++-- filter is then NULL, so no customer passes, and the join is empty.
++-- ===================================================================
++SET postgres_fdw.semijoin_force_path = index;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.customer_id IS NULL$$);
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id < 0$$);
++SET postgres_fdw.semijoin_force_path = filter;
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.customer_id IS NULL$$);
++SELECT * FROM sj_compare($$SELECT o.order_id, c.name FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id < 0$$);
++RESET postgres_fdw.semijoin_force_path;
++
++-- ===================================================================
++-- Step 8: GROUP BY is rewritten too, and gives the same groups
++-- ===================================================================
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT c.city, count(*), sum(o.amount)
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 100
++GROUP BY c.city;
++SELECT * FROM sj_compare($$SELECT c.city, count(*) AS num_orders, sum(o.amount) AS total FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id WHERE o.order_id <= 100 GROUP BY c.city$$);
++
++-- ===================================================================
++-- Step 9: queries that must NOT be rewritten (verbose says why)
++-- ===================================================================
++SET postgres_fdw.semijoin_verbose = on;
++
++-- a LEFT JOIN needs the unmatched orders too
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o LEFT JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++
++-- a volatile local condition could pick other rows on the second read
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50 AND random() < 2;
++
++-- the table option semijoin_filter = false wins over the server's true
++ALTER FOREIGN TABLE ft_customers OPTIONS (ADD semijoin_filter 'false');
++EXPLAIN (VERBOSE, COSTS OFF)
++SELECT o.order_id, c.name
++FROM orders_l o JOIN ft_customers c ON c.id = o.customer_id
++WHERE o.order_id <= 50;
++ALTER FOREIGN TABLE ft_customers OPTIONS (DROP semijoin_filter);
++
++-- an invalid option value is rejected
++ALTER SERVER sj_loopback OPTIONS (SET semijoin_filter 'maybe');
++
++RESET postgres_fdw.semijoin_verbose;
++
++-- ===================================================================
++-- Step 10: clean up
++-- ===================================================================
++DROP FUNCTION sj_compare(text);
++DROP FUNCTION sj_explain_analyze(text);
++DROP FOREIGN TABLE ft_customers;
++DROP TABLE orders_l;
++DROP SCHEMA sj_remote CASCADE;
++DROP USER MAPPING FOR CURRENT_USER SERVER sj_loopback;
++DROP SERVER sj_loopback;
++DROP EXTENSION sjbloom;
++DROP EXTENSION postgres_fdw;
