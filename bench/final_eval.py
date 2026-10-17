@@ -199,6 +199,11 @@ def unix_socket_dir():
     conn = common.connect("site_a")
     setting = conn.execute("SHOW unix_socket_directories").fetchone()[0]
     conn.close()
+    # On a cluster with encoding SQL_ASCII (initdb under a C/POSIX locale),
+    # psycopg cannot decode text and returns bytes instead of str. Turn it
+    # into a str first, otherwise split(",") fails with a TypeError.
+    if isinstance(setting, bytes):
+        setting = setting.decode("ascii", errors="replace")
     return setting.split(",")[0].strip()
 
 
